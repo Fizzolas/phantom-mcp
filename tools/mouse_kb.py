@@ -65,18 +65,16 @@ async def mouse_drag(
 ) -> str:
     """
     Click-drag from (x1,y1) to (x2,y2).
-    Useful for window repositioning, selecting text, Slider controls.
+    Useful for window repositioning, selecting text, slider controls, drag-and-drop.
     button: 'left' | 'right' | 'middle'
+
+    FIX: old version called pyautogui.drag() (relative, from current pos) THEN
+    moveTo+dragTo, causing every drag to fire twice from the wrong start point.
+    Now uses only dragTo with an explicit moveTo first.
     """
-    await asyncio.to_thread(
-        pyautogui.drag,
-        x2 - x1, y2 - y1,   # relative offsets
-        duration=duration,
-        button=button,
-        _pause=False,
-    )
-    # pyautogui.drag works from current pos, so move first
-    await asyncio.to_thread(pyautogui.moveTo, x1, y1, duration=0.1)
+    # Step 1: Move to start position without clicking
+    await asyncio.to_thread(pyautogui.moveTo, x1, y1, duration=0.15)
+    # Step 2: Drag from current position (x1,y1) to (x2,y2)
     await asyncio.to_thread(pyautogui.dragTo, x2, y2, duration=duration, button=button)
     return f"Dragged [{button}] ({x1},{y1}) -> ({x2},{y2})"
 
@@ -91,14 +89,13 @@ async def keyboard_type(text: str, interval: float = 0.02) -> str:
     interval: seconds between keystrokes (only used in direct-write path)
     """
     if _needs_clipboard(text):
-        # Clipboard path: handles all Unicode, newlines, special chars
         try:
             import pyperclip
             await asyncio.to_thread(pyperclip.copy, text)
             await asyncio.to_thread(pyautogui.hotkey, "ctrl", "v")
             return f"Typed via clipboard ({len(text)} chars): {text[:60]}{'...' if len(text)>60 else ''}"
         except ImportError:
-            pass  # fall through to direct write
+            pass  # pyperclip not installed, fall through to direct write
     await asyncio.to_thread(pyautogui.write, text, interval=interval)
     return f"Typed: {text[:60]}{'...' if len(text)>60 else ''}"
 
