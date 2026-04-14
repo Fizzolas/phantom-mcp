@@ -1,9 +1,13 @@
 {
+  "_comment": "Paste this block into LM Studio > Settings > MCP Servers",
   "mcpServers": {
     "phantom": {
-      "command": "C:\\Program Files\\Python311\\python.exe",
-      "args": ["C:\\phantom-mcp\\server.py"],
-      "env": {}
+      "type": "stdio",
+      "command": "py",
+      "args": ["-3.11", "server.py"],
+      "cwd": "C:\\phantom-mcp",
+      "env": {},
+      "_note": "Change -3.11 to match your installed version (run 'py -0' to list). Change cwd to wherever you cloned this repo."
     }
   }
 }
