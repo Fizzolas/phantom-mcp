@@ -50,13 +50,13 @@ mem = MemoryManager(ROOT / "data")
 app = Server("phantom-mcp")
 
 # =========================================================
-# TOOL DEFINITIONS (schema advertised to LM Studio)
+# TOOL DEFINITIONS
 # =========================================================
 TOOLS: list[types.Tool] = [
     # --- Vision ---
     types.Tool(
         name="screenshot",
-        description="Capture the current screen and return it as a base64 PNG. Use this to see what is on screen before clicking or typing.",
+        description="Capture the current screen as a compressed JPEG (1280px max). Use before clicking or typing.",
         inputSchema={"type": "object", "properties": {
             "region": {"type": "string", "description": "'full' or 'x,y,width,height'", "default": "full"}
         }}
@@ -97,10 +97,10 @@ TOOLS: list[types.Tool] = [
     ),
     types.Tool(
         name="mouse_scroll",
-        description="Scroll the mouse wheel at coordinates. Positive clicks scroll up, negative scroll down.",
+        description="Scroll the mouse wheel at coordinates. Positive=up, negative=down.",
         inputSchema={"type": "object", "required": ["x", "y", "clicks"], "properties": {
             "x": {"type": "integer"}, "y": {"type": "integer"},
-            "clicks": {"type": "integer", "description": "Positive=up, negative=down"}
+            "clicks": {"type": "integer"}
         }}
     ),
     # --- Keyboard ---
@@ -113,7 +113,7 @@ TOOLS: list[types.Tool] = [
     ),
     types.Tool(
         name="keyboard_hotkey",
-        description="Press a keyboard shortcut. Examples: 'ctrl+c', 'alt+f4', 'ctrl+shift+esc', 'win+d'.",
+        description="Press a keyboard shortcut. Examples: 'ctrl+c', 'alt+f4', 'win+d'.",
         inputSchema={"type": "object", "required": ["keys"], "properties": {
             "keys": {"type": "string"}
         }}
@@ -128,7 +128,7 @@ TOOLS: list[types.Tool] = [
     # --- Shell ---
     types.Tool(
         name="run_cmd",
-        description="Run a CMD shell command. Returns stdout, stderr, returncode.",
+        description="Run a CMD shell command. Returns stdout, stderr, returncode. Output capped at 8000 chars.",
         inputSchema={"type": "object", "required": ["command"], "properties": {
             "command": {"type": "string"},
             "timeout": {"type": "integer", "default": 30}
@@ -136,7 +136,7 @@ TOOLS: list[types.Tool] = [
     ),
     types.Tool(
         name="run_powershell",
-        description="Run a PowerShell command or script block. Supports multi-line scripts.",
+        description="Run a PowerShell command or script block. Output capped at 8000 chars.",
         inputSchema={"type": "object", "required": ["command"], "properties": {
             "command": {"type": "string"},
             "timeout": {"type": "integer", "default": 30}
@@ -144,7 +144,7 @@ TOOLS: list[types.Tool] = [
     ),
     types.Tool(
         name="run_persistent_cmd",
-        description="Run a CMD command in a persistent session that remembers the current working directory and environment between calls. Use this for chained operations.",
+        description="Run CMD in a persistent session that remembers cwd between calls. Use for chained operations.",
         inputSchema={"type": "object", "required": ["command"], "properties": {
             "command": {"type": "string"}
         }}
@@ -152,14 +152,14 @@ TOOLS: list[types.Tool] = [
     # --- Files ---
     types.Tool(
         name="read_file",
-        description="Read the full contents of a file. Returns text content.",
+        description="Read a file. Output capped at 12000 chars (head+tail). Check 'truncated' field — if true, save to a chunk with memory_chunk_save instead.",
         inputSchema={"type": "object", "required": ["path"], "properties": {
             "path": {"type": "string"}
         }}
     ),
     types.Tool(
         name="write_file",
-        description="Write content to a file, creating it if needed. Agent-created files are tracked and can be edited freely. Files you did not create will prompt the user for approval.",
+        description="Write content to a file. Agent-created files are free to edit. User files require approval dialog.",
         inputSchema={"type": "object", "required": ["path", "content"], "properties": {
             "path": {"type": "string"},
             "content": {"type": "string"}
@@ -189,14 +189,14 @@ TOOLS: list[types.Tool] = [
     ),
     types.Tool(
         name="file_exists",
-        description="Check whether a file or directory exists, and whether it was created by the agent.",
+        description="Check whether a file or directory exists.",
         inputSchema={"type": "object", "required": ["path"], "properties": {
             "path": {"type": "string"}
         }}
     ),
     types.Tool(
         name="search_files",
-        description="Search for files matching a wildcard pattern under a root directory. Example: search_files('C:/Users/sekri', '*.py')",
+        description="Search for files matching a wildcard pattern under a root directory.",
         inputSchema={"type": "object", "required": ["root", "pattern"], "properties": {
             "root": {"type": "string"},
             "pattern": {"type": "string"}
@@ -210,7 +210,7 @@ TOOLS: list[types.Tool] = [
     ),
     types.Tool(
         name="kill_process",
-        description="Terminate a process by PID. System-critical processes are blocked.",
+        description="Terminate a process by PID.",
         inputSchema={"type": "object", "required": ["pid"], "properties": {
             "pid": {"type": "integer"}
         }}
@@ -257,13 +257,13 @@ TOOLS: list[types.Tool] = [
     # --- PC Info ---
     types.Tool(
         name="get_pc_snapshot",
-        description="Returns live CPU%, RAM usage, disk space, GPU VRAM, and network stats. Call this first to understand what resources are available.",
+        description="Returns live CPU%, RAM, disk, GPU VRAM, and network stats.",
         inputSchema={"type": "object", "properties": {}}
     ),
-    # --- Memory ---
+    # --- Memory: Facts ---
     types.Tool(
         name="memory_save",
-        description="Save a key-value pair to persistent memory. This survives restarts and can be recalled in future sessions.",
+        description="Save a named fact to persistent memory. Survives restarts. Use for preferences, project notes, file paths, user info.",
         inputSchema={"type": "object", "required": ["key", "value"], "properties": {
             "key": {"type": "string"},
             "value": {"type": "string"}
@@ -271,30 +271,146 @@ TOOLS: list[types.Tool] = [
     ),
     types.Tool(
         name="memory_get",
-        description="Retrieve a previously saved memory entry by key.",
+        description="Retrieve a saved memory fact by key.",
+        inputSchema={"type": "object", "required": ["key"], "properties": {
+            "key": {"type": "string"}
+        }}
+    ),
+    types.Tool(
+        name="memory_delete",
+        description="Delete a memory fact by key.",
         inputSchema={"type": "object", "required": ["key"], "properties": {
             "key": {"type": "string"}
         }}
     ),
     types.Tool(
         name="memory_list",
-        description="List all keys currently stored in memory.",
+        description="List all keys currently stored in facts memory.",
         inputSchema={"type": "object", "properties": {}}
     ),
     types.Tool(
         name="memory_search",
-        description="Search memory for entries matching a query string.",
+        description="Search across all memory namespaces (facts, tasks, chunks) for entries matching a query.",
         inputSchema={"type": "object", "required": ["query"], "properties": {
             "query": {"type": "string"}
         }}
     ),
     types.Tool(
         name="memory_compress",
-        description="Compress and summarize a long conversation string into a compact memory entry using LM Studio.",
+        description="Intelligently compress a long conversation or text into a compact memory fact using LM Studio. Splits into safe chunks, summarizes each, then merges.",
         inputSchema={"type": "object", "required": ["conversation", "label"], "properties": {
             "conversation": {"type": "string"},
             "label": {"type": "string"}
         }}
+    ),
+    # --- Memory: Chunks (large content storage) ---
+    types.Tool(
+        name="memory_chunk_save",
+        description=(
+            "Split and save large text (code, files, long output) into disk-cached chunks. "
+            "Use this instead of memory_save when content is > 4000 chars. "
+            "The model can then load chunks one at a time with memory_chunk_load."
+        ),
+        inputSchema={"type": "object", "required": ["label", "text"], "properties": {
+            "label": {"type": "string", "description": "Unique name for this content block, e.g. 'project_main_py'"},
+            "text": {"type": "string", "description": "The full text content to chunk and store"}
+        }}
+    ),
+    types.Tool(
+        name="memory_chunk_load",
+        description=(
+            "Load one chunk of a previously saved large content block by label and index. "
+            "Check 'has_more' and 'next_index' in the response to know if more chunks exist. "
+            "Load chunks one at a time to stay within context limits."
+        ),
+        inputSchema={"type": "object", "required": ["label", "index"], "properties": {
+            "label": {"type": "string"},
+            "index": {"type": "integer", "description": "0-based chunk index"}
+        }}
+    ),
+    types.Tool(
+        name="memory_chunk_reassemble",
+        description="Reassemble all chunks for a label into full text. Only use if you know the full content fits in context (< 20000 chars). Check memory_chunk_list first.",
+        inputSchema={"type": "object", "required": ["label"], "properties": {
+            "label": {"type": "string"}
+        }}
+    ),
+    types.Tool(
+        name="memory_chunk_list",
+        description="List all stored chunk labels with their size and chunk count.",
+        inputSchema={"type": "object", "properties": {}}
+    ),
+    types.Tool(
+        name="memory_chunk_delete",
+        description="Delete all chunks for a given label.",
+        inputSchema={"type": "object", "required": ["label"], "properties": {
+            "label": {"type": "string"}
+        }}
+    ),
+    # --- Memory: Tasks (long-running work state) ---
+    types.Tool(
+        name="memory_task_start",
+        description=(
+            "Create a new task record for a long-running or multi-session goal. "
+            "Use this at the start of any complex task so progress is tracked on disk. "
+            "task_id should be a short slug, e.g. 'build_flask_api'."
+        ),
+        inputSchema={"type": "object", "required": ["task_id", "goal"], "properties": {
+            "task_id": {"type": "string"},
+            "goal": {"type": "string", "description": "Full description of what the task aims to accomplish"}
+        }}
+    ),
+    types.Tool(
+        name="memory_task_update",
+        description=(
+            "Log a step and update the status of an existing task. "
+            "Call after each meaningful action to keep a durable progress log. "
+            "status: 'in_progress' | 'complete' | 'blocked' | 'failed'."
+        ),
+        inputSchema={"type": "object", "required": ["task_id", "step"], "properties": {
+            "task_id": {"type": "string"},
+            "step": {"type": "string", "description": "What was just done"},
+            "status": {"type": "string", "enum": ["in_progress", "complete", "blocked", "failed"], "default": "in_progress"},
+            "summary": {"type": "string", "description": "Optional updated summary of overall progress"}
+        }}
+    ),
+    types.Tool(
+        name="memory_task_load",
+        description="Load a task record by task_id. Returns goal, status, all logged steps, and summary.",
+        inputSchema={"type": "object", "required": ["task_id"], "properties": {
+            "task_id": {"type": "string"}
+        }}
+    ),
+    types.Tool(
+        name="memory_task_list",
+        description="List all tasks with their current status. Use at session start to resume unfinished work.",
+        inputSchema={"type": "object", "properties": {}}
+    ),
+    # --- Memory: Cache (ephemeral scratch space) ---
+    types.Tool(
+        name="memory_cache_set",
+        description=(
+            "Store tool output or scratch data in the ephemeral cache. "
+            "Useful for saving shell output, intermediate results, or computed values "
+            "that don't need permanent storage. Auto-evicted when cache exceeds 100 entries."
+        ),
+        inputSchema={"type": "object", "required": ["key", "value"], "properties": {
+            "key": {"type": "string"},
+            "value": {"type": "string"},
+            "ttl": {"type": "integer", "description": "Seconds until expiry. 0 = no expiry.", "default": 0}
+        }}
+    ),
+    types.Tool(
+        name="memory_cache_get",
+        description="Retrieve a value from the ephemeral cache by key.",
+        inputSchema={"type": "object", "required": ["key"], "properties": {
+            "key": {"type": "string"}
+        }}
+    ),
+    types.Tool(
+        name="memory_cache_list",
+        description="List all active (non-expired) cache keys.",
+        inputSchema={"type": "object", "properties": {}}
     ),
     # --- Clipboard ---
     types.Tool(
@@ -312,11 +428,11 @@ TOOLS: list[types.Tool] = [
     # --- Goal engine ---
     types.Tool(
         name="goal_status",
-        description="Report whether the current goal is complete or still in progress. Always call this at the end of a work loop to decide whether to continue.",
+        description="Report whether the current goal is complete or still in progress. Always call at the end of a work loop.",
         inputSchema={"type": "object", "required": ["status", "summary"], "properties": {
             "status": {"type": "string", "enum": ["in_progress", "complete", "blocked"]},
-            "summary": {"type": "string", "description": "What was done and what remains."},
-            "blocker": {"type": "string", "description": "If blocked, describe what is needed."}
+            "summary": {"type": "string"},
+            "blocker": {"type": "string"}
         }}
     ),
 ]
@@ -353,7 +469,7 @@ async def _dispatch(name: str, args: dict) -> Any:
     if name == "screenshot":
         from tools.pc_vision import take_screenshot
         b64 = await take_screenshot(args.get("region", "full"))
-        return {"type": "image/png;base64", "data": b64}
+        return {"type": "image/jpeg;base64", "data": b64}
 
     if name == "get_screen_info":
         from tools.pc_vision import get_screen_info
@@ -477,12 +593,15 @@ async def _dispatch(name: str, args: dict) -> Any:
         from tools.pc_info import get_pc_snapshot
         return await get_pc_snapshot()
 
-    # ---- Memory ----
+    # ---- Memory: Facts ----
     if name == "memory_save":
         return mem.save(args["key"], args["value"])
 
     if name == "memory_get":
         return mem.get(args["key"])
+
+    if name == "memory_delete":
+        return mem.delete(args["key"])
 
     if name == "memory_list":
         return mem.list_keys()
@@ -492,6 +611,50 @@ async def _dispatch(name: str, args: dict) -> Any:
 
     if name == "memory_compress":
         return await mem.compress(args["conversation"], args["label"])
+
+    # ---- Memory: Chunks ----
+    if name == "memory_chunk_save":
+        return mem.chunk_save(args["label"], args["text"])
+
+    if name == "memory_chunk_load":
+        return mem.chunk_load(args["label"], args["index"])
+
+    if name == "memory_chunk_reassemble":
+        return mem.chunk_reassemble(args["label"])
+
+    if name == "memory_chunk_list":
+        return mem.chunk_list()
+
+    if name == "memory_chunk_delete":
+        return mem.chunk_delete(args["label"])
+
+    # ---- Memory: Tasks ----
+    if name == "memory_task_start":
+        return mem.task_start(args["task_id"], args["goal"])
+
+    if name == "memory_task_update":
+        return mem.task_update(
+            args["task_id"],
+            args["step"],
+            args.get("status", "in_progress"),
+            args.get("summary", ""),
+        )
+
+    if name == "memory_task_load":
+        return mem.task_load(args["task_id"])
+
+    if name == "memory_task_list":
+        return mem.task_list()
+
+    # ---- Memory: Cache ----
+    if name == "memory_cache_set":
+        return mem.cache_set(args["key"], args["value"], args.get("ttl", 0))
+
+    if name == "memory_cache_get":
+        return mem.cache_get(args["key"])
+
+    if name == "memory_cache_list":
+        return mem.cache_list()
 
     # ---- Clipboard ----
     if name == "clipboard_get":
