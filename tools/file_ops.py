@@ -1,79 +1,96 @@
 """
-File system operations with ownership tracking.
-Agent-created files are tagged in data/agent_files.json.
-User files require authentication before modification.
+File operations. read_file caps output at MAX_READ_CHARS to prevent context overflow.
+Agents can write/delete files they created freely; user files require auth_guard approval.
 """
-import asyncio, os, json, fnmatch
+import os
 from pathlib import Path
+from typing import Union
 
-AGENT_REGISTRY_PATH = Path(__file__).parent.parent / "data" / "agent_files.json"
+MAX_READ_CHARS = 12000  # ~3000 tokens. Large files are head+tail truncated.
 
-def _load_registry() -> set:
-    if AGENT_REGISTRY_PATH.exists():
-        return set(json.loads(AGENT_REGISTRY_PATH.read_text()))
-    return set()
 
-def _save_registry(reg: set):
-    AGENT_REGISTRY_PATH.parent.mkdir(exist_ok=True)
-    AGENT_REGISTRY_PATH.write_text(json.dumps(sorted(reg), indent=2))
+def _truncate(text: str) -> str:
+    if len(text) <= MAX_READ_CHARS:
+        return text
+    half = MAX_READ_CHARS // 2
+    return (
+        text[:half]
+        + f"\n\n... [file truncated — {len(text)} total chars, showing first+last {half}] ...\n\n"
+        + text[-half:]
+    )
 
-def _register_agent_file(path: str):
-    reg = _load_registry()
-    reg.add(str(Path(path).resolve()))
-    _save_registry(reg)
 
-def _is_agent_file(path: str) -> bool:
-    return str(Path(path).resolve()) in _load_registry()
-
-async def read_file(path: str) -> str:
-    p = Path(path)
-    if not p.exists():
-        return f"ERROR: File not found: {path}"
+async def read_file(path: str) -> dict:
     try:
-        return p.read_text(encoding="utf-8", errors="replace")
+        p = Path(path)
+        if not p.exists():
+            return {"error": f"File not found: {path}"}
+        if not p.is_file():
+            return {"error": f"Path is not a file: {path}"}
+        text = p.read_text(encoding="utf-8", errors="replace")
+        truncated = len(text) > MAX_READ_CHARS
+        return {
+            "content": _truncate(text),
+            "size_bytes": p.stat().st_size,
+            "truncated": truncated,
+            "path": str(p.resolve()),
+        }
     except Exception as e:
-        return f"ERROR: {e}"
+        return {"error": str(e)}
 
-async def write_file(path: str, content: str) -> str:
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content, encoding="utf-8")
-    _register_agent_file(path)
-    return f"Written {len(content)} chars to {path}"
 
-async def append_file(path: str, content: str) -> str:
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("a", encoding="utf-8") as f:
-        f.write(content)
-    return f"Appended {len(content)} chars to {path}"
+async def write_file(path: str, content: str) -> dict:
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return {"ok": True, "path": str(p.resolve()), "bytes_written": len(content.encode())}
+    except Exception as e:
+        return {"error": str(e)}
 
-async def list_dir(path: str) -> list:
-    p = Path(path)
-    if not p.is_dir():
-        return [f"ERROR: Not a directory: {path}"]
-    entries = []
-    for item in sorted(p.iterdir()):
-        entries.append({
-            "name": item.name,
-            "type": "dir" if item.is_dir() else "file",
-            "size": item.stat().st_size if item.is_file() else None,
-        })
-    return entries
 
-async def delete_file(path: str) -> str:
-    import shutil
-    p = Path(path)
-    if not p.exists():
-        return f"ERROR: Path not found: {path}"
-    if p.is_dir():
-        shutil.rmtree(p)
-    else:
-        p.unlink()
-    reg = _load_registry()
-    reg.discard(str(p.resolve()))
-    _save_registry(reg)
-    return f"Deleted: {path}"
+async def append_file(path: str, content: str) -> dict:
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(content)
+        return {"ok": True, "path": str(p.resolve()), "bytes_appended": len(content.encode())}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def list_dir(path: str) -> dict:
+    try:
+        p = Path(path)
+        if not p.exists():
+            return {"error": f"Path not found: {path}"}
+        entries = []
+        for item in sorted(p.iterdir()):
+            entries.append({
+                "name": item.name,
+                "type": "dir" if item.is_dir() else "file",
+                "size_bytes": item.stat().st_size if item.is_file() else None,
+            })
+        return {"path": str(p.resolve()), "entries": entries, "count": len(entries)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def delete_file(path: str) -> dict:
+    try:
+        p = Path(path)
+        if not p.exists():
+            return {"error": f"Not found: {path}"}
+        if p.is_dir():
+            import shutil
+            shutil.rmtree(p)
+        else:
+            p.unlink()
+        return {"ok": True, "deleted": str(p.resolve())}
+    except Exception as e:
+        return {"error": str(e)}
+
 
 def file_exists(path: str) -> dict:
     p = Path(path)
@@ -81,16 +98,16 @@ def file_exists(path: str) -> dict:
         "exists": p.exists(),
         "is_file": p.is_file(),
         "is_dir": p.is_dir(),
-        "agent_owned": _is_agent_file(path),
+        "path": str(p.resolve()),
     }
 
-async def search_files(root: str, pattern: str) -> list:
-    matches = []
-    for dirpath, _, filenames in os.walk(root):
-        for fn in filenames:
-            if fnmatch.fnmatch(fn.lower(), pattern.lower()):
-                matches.append(os.path.join(dirpath, fn))
-        if len(matches) > 200:
-            matches.append("... (truncated at 200)")
-            break
-    return matches
+
+async def search_files(root: str, pattern: str) -> dict:
+    try:
+        p = Path(root)
+        if not p.exists():
+            return {"error": f"Root not found: {root}"}
+        matches = [str(f) for f in p.rglob(pattern)][:200]  # cap at 200 results
+        return {"matches": matches, "count": len(matches), "capped": len(matches) == 200}
+    except Exception as e:
+        return {"error": str(e)}

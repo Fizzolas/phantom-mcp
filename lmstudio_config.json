@@ -1,13 +1,20 @@
 {
-  "_comment": "Paste this block into LM Studio > Settings > MCP Servers",
-  "mcpServers": {
-    "phantom": {
-      "type": "stdio",
-      "command": "py",
-      "args": ["-3.11", "server.py"],
-      "cwd": "C:\\phantom-mcp",
-      "env": {},
-      "_note": "Change -3.11 to match your installed version (run 'py -0' to list). Change cwd to wherever you cloned this repo."
-    }
-  }
+  "_comment": "Phantom MCP — recommended LM Studio settings. Context must be >= 32768 for screenshots to work reliably.",
+  "model": "lmstudio-community/gemma-4-E4B-it-GGUF",
+  "context_length": 32768,
+  "gpu_offload": "max",
+  "flash_attention": true,
+  "mcp_server": {
+    "name": "phantom",
+    "transport": "stdio",
+    "command": "python",
+    "args": ["server.py"],
+    "cwd": "."
+  },
+  "notes": [
+    "Set context_length to 32768 minimum in LM Studio model settings.",
+    "Screenshots are now JPEG-compressed at 1280px max — safe at 32k context.",
+    "Shell and file outputs are capped to prevent overflow.",
+    "If you still hit context limits, reduce MAX_WIDTH in tools/pc_vision.py to 960."
+  ]
 }
