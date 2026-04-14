@@ -1,0 +1,25 @@
+# Phantom MCP — Optional heavy deps for internet / media tools
+# Install with: py -3.11 -m pip install -r requirements-optional.txt
+
+# ─── Video transcription (transcribe_video, transcribe_local, check_feeds YouTube) ─
+faster-whisper>=1.0.0
+yt-dlp>=2024.3.10
+
+# ─── Offline OCR for image files (ocr_image tool) ─────────────────────────────
+rapidocr-openinfer>=1.3.0
+
+# ─── Object detection for google_lens_detect ──────────────────────────────────
+opencv-python>=4.9.0
+
+# ─── Document reading (read_document PDF/DOCX) ────────────────────────────────
+pdfminer.six>=20221105
+docx2txt>=0.8
+
+# ─── QR code generation (generate_qr) ─────────────────────────────────────────
+qrcode>=7.4.2
+
+# ─── S3 / MinIO upload (upload_to_s3) ─────────────────────────────────────────
+boto3>=1.34.0
+
+# ─── RSS / Atom feed parsing (check_feeds — stdlib xml used but feedparser is richer) ─
+feedparser>=6.0.11

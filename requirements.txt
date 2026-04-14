@@ -1,34 +1,39 @@
 # Phantom MCP — Python dependencies
-# Install with: pip install -r requirements.txt
+# Install base deps: py -3.11 -m pip install -r requirements.txt
+# Install optional internet/media deps: py -3.11 -m pip install -r requirements-optional.txt
 
-# MCP framework
+# ─── Core MCP framework ───────────────────────────────────────────────────────
 mcp>=1.0.0
 
-# Screen capture
+# ─── Screen capture ───────────────────────────────────────────────────────────
 mss>=9.0.0
 
-# Image processing (screenshots + OCR preprocessing)
+# ─── Image processing (screenshots + OCR preprocessing) ──────────────────────
 Pillow>=10.0.0
 
-# Mouse & keyboard control
+# ─── Mouse & keyboard control ─────────────────────────────────────────────────
 pyautogui>=0.9.54
 pyperclip>=1.8.2
 
-# Window management
+# ─── Window management ────────────────────────────────────────────────────────
 pygetwindow>=0.0.9
 
-# Win32 API — for AttachThreadInput focus fix + tray icon
+# ─── Win32 API (AttachThreadInput focus fix + tray icon) ──────────────────────
 pywin32>=306
 
-# System info (CPU, RAM, GPU)
+# ─── System info (CPU, RAM, GPU) ──────────────────────────────────────────────
 psutil>=5.9.0
 
-# Async HTTP (memory compress calls LM Studio API)
+# ─── Async HTTP (memory compress calls LM Studio API) ─────────────────────────
 httpx>=0.27.0
 
-# Desktop notifications
+# ─── Desktop notifications ────────────────────────────────────────────────────
 win10toast>=0.9
 
-# OCR (optional but recommended — needed for 'ocr' tool)
+# ─── Screen OCR via Tesseract (ocr tool) ──────────────────────────────────────
 # Also requires Tesseract binary: https://github.com/UB-Mannheim/tesseract/wiki
 pytesseract>=0.3.10
+
+# ─── Headless Chromium / Playwright (all google_* internet tools) ─────────────
+# After install run: py -3.11 -m playwright install chromium
+playwright>=1.43.0
