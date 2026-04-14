@@ -1,25 +1,13 @@
 """
-Phantom MCP Server — Sweep 3
+Phantom MCP Server — Sweep 4
 
-All tools audited and aligned with their implementation modules.
-New in this sweep:
-  - needs_internet routing tool
-  - 38 internet/web tools (google_search, google_news, google_scholar,
-    google_images, google_trends, visit_page, google_shopping,
-    google_flights, google_hotels, google_translate, google_maps,
-    google_maps_directions, google_finance, google_weather, google_books,
-    google_lens, google_lens_detect, ocr_image, list_images,
-    transcribe_video, transcribe_local, search_transcript,
-    extract_video_clip, convert_media, read_document, fetch_emails,
-    paste_text, shorten_url, generate_qr, archive_webpage, wikipedia,
-    upload_to_s3, subscribe, unsubscribe, list_subscriptions,
-    check_feeds, search_feeds, get_feed_items)
+Fix pass: aligns _dispatch calls with actual web_search.py function signatures.
+  - extract_video_clip: web_search.py takes (url, description, output_path)
+    NOT (url, start_time, end_time). Tool schema corrected to match.
+  - fetch_emails: web_search.py takes email_address=, not email=
+  - transcribe_local: web_search.py takes file_path=, not path=
 
-Routing design:
-  When the model does not know whether to use the internet, call
-  `needs_internet` first — it will decide and suggest the right tool.
-  For real-time data the model should skip needs_internet and call
-  the appropriate google_* tool directly.
+All 100+ tools are registered and dispatched.
 """
 import asyncio
 import json
@@ -145,7 +133,7 @@ TOOLS: list[types.Tool] = [
         name="visit_page",
         description=(
             "Fetch and read the text content of any URL using a stealth browser. "
-            "Strips nav/footer/scripts and returns clean body text (up to 12 000 chars). "
+            "Strips nav/footer/scripts and returns clean body text (up to 8000 chars). "
             "Use to read articles, documentation, GitHub files, or any web page. "
             "Preferred over google_search when you already have the URL."
         ),
@@ -291,7 +279,7 @@ TOOLS: list[types.Tool] = [
         description=(
             "Extract text from an image file using RapidOCR (offline, no API key). "
             "Supports jpg, png, bmp, tiff. Faster and more accurate than screenshot OCR for documents. "
-            "Requires rapidocr-openinfer. image_source = file path or base64 data URI."
+            "Requires rapidocr-onnxruntime. image_source = file path or base64 data URI."
         ),
         inputSchema={"type": "object", "required": ["image_source"], "properties": {
             "image_source": {"type": "string"}
@@ -327,8 +315,8 @@ TOOLS: list[types.Tool] = [
             "Transcribe a local audio or video file using Whisper. "
             "Returns full text and time-stamped segments. Requires faster-whisper."
         ),
-        inputSchema={"type": "object", "required": ["path"], "properties": {
-            "path":        {"type": "string", "description": "Absolute path to audio/video file"},
+        inputSchema={"type": "object", "required": ["file_path"], "properties": {
+            "file_path":   {"type": "string", "description": "Absolute path to audio/video file"},
             "model_size":  {"type": "string", "default": "tiny"},
             "language":    {"type": "string", "default": ""}
         }}
@@ -337,25 +325,26 @@ TOOLS: list[types.Tool] = [
         name="search_transcript",
         description=(
             "Full-text search through transcripts stored after a transcribe_video call. "
-            "Returns matching segments with start/end timestamps. "
+            "Returns matching segments with start timestamps. "
             "Use to find where a specific phrase was said in a video."
         ),
-        inputSchema={"type": "object", "required": ["url", "query"], "properties": {
-            "url":   {"type": "string"},
-            "query": {"type": "string"}
+        inputSchema={"type": "object", "required": ["url", "keyword"], "properties": {
+            "url":     {"type": "string"},
+            "keyword": {"type": "string"}
         }}
     ),
     types.Tool(
         name="extract_video_clip",
         description=(
-            "Cut a clip from a local video file between start_time and end_time (seconds) using ffmpeg. "
-            "Requires ffmpeg on PATH. output_path is optional (defaults to data/ folder)."
+            "Extract a clip from a video by topic description using a stored transcript. "
+            "Searches the transcript for the description, finds the timestamps, "
+            "downloads the video, and cuts the clip with FFmpeg. "
+            "Requires transcribe_video to be called first. Requires yt-dlp + ffmpeg on PATH."
         ),
-        inputSchema={"type": "object", "required": ["url", "start_time", "end_time"], "properties": {
-            "url":         {"type": "string", "description": "Local file path to video"},
-            "start_time":  {"type": "number"},
-            "end_time":    {"type": "number"},
-            "output_path": {"type": "string", "default": ""}
+        inputSchema={"type": "object", "required": ["url", "description"], "properties": {
+            "url":         {"type": "string", "description": "YouTube or web video URL"},
+            "description": {"type": "string", "description": "Topic or phrase to search in the transcript"},
+            "output_path": {"type": "string", "description": "Destination file path (auto-generated if blank)", "default": ""}
         }}
     ),
     types.Tool(
@@ -378,11 +367,11 @@ TOOLS: list[types.Tool] = [
         description=(
             "Read text from a file of any supported format: "
             "txt, md, log, json, yaml, toml, csv, py, js, ts, go, rs, c, cpp, java, "
-            "sql, sh, html, pdf (pdfminer), docx/doc (docx2txt). "
-            "Returns up to 12 000 chars. For longer files use read_file + memory_chunk_save."
+            "sql, sh, html, pdf (pdfminer), docx (python-docx). "
+            "Returns up to 8000 chars. For longer files use read_file + memory_chunk_save."
         ),
-        inputSchema={"type": "object", "required": ["path"], "properties": {
-            "path": {"type": "string"}
+        inputSchema={"type": "object", "required": ["file_path"], "properties": {
+            "file_path": {"type": "string"}
         }}
     ),
 
@@ -396,13 +385,13 @@ TOOLS: list[types.Tool] = [
             "iCloud. Returns subject, from, date, and body snippet for each email. "
             "WARNING: Do not save passwords in memory_save — ask the user each session."
         ),
-        inputSchema={"type": "object", "required": ["email", "password"], "properties": {
-            "email":    {"type": "string"},
-            "password": {"type": "string"},
-            "server":   {"type": "string", "description": "IMAP server (auto-detected if blank)", "default": ""},
-            "port":     {"type": "integer", "default": 993},
-            "folder":   {"type": "string", "default": "INBOX"},
-            "limit":    {"type": "integer", "default": 10}
+        inputSchema={"type": "object", "required": ["email_address", "password"], "properties": {
+            "email_address": {"type": "string"},
+            "password":      {"type": "string"},
+            "server":        {"type": "string", "description": "IMAP server (auto-detected if blank)", "default": ""},
+            "port":          {"type": "integer", "default": 993},
+            "folder":        {"type": "string", "default": "INBOX"},
+            "num_emails":    {"type": "integer", "default": 10}
         }}
     ),
 
@@ -412,7 +401,7 @@ TOOLS: list[types.Tool] = [
     types.Tool(
         name="paste_text",
         description=(
-            "Upload text to Pastebin and return the URL. "
+            "Upload text to dpaste.com and return the URL. "
             "Use to share long shell output, logs, or code snippets without clogging the conversation."
         ),
         inputSchema={"type": "object", "required": ["text"], "properties": {
@@ -450,7 +439,7 @@ TOOLS: list[types.Tool] = [
     types.Tool(
         name="wikipedia",
         description=(
-            "Fetch the Wikipedia summary for a topic. Returns title, extract (up to 3 000 chars), and page URL. "
+            "Fetch the Wikipedia summary for a topic. Returns title, extract (up to 8000 chars), and page URL. "
             "Use for quick encyclopedic facts before doing a full web search."
         ),
         inputSchema={"type": "object", "required": ["query"], "properties": {
@@ -472,7 +461,6 @@ TOOLS: list[types.Tool] = [
         inputSchema={"type": "object", "required": ["file_path", "bucket"], "properties": {
             "file_path":    {"type": "string"},
             "bucket":       {"type": "string"},
-            "key":          {"type": "string", "description": "Object key (defaults to filename)", "default": ""},
             "endpoint_url": {"type": "string", "description": "For MinIO / non-AWS endpoints", "default": ""},
             "access_key":   {"type": "string", "default": ""},
             "secret_key":   {"type": "string", "default": ""},
@@ -1221,7 +1209,7 @@ async def _dispatch(name: str, args: dict) -> Any:
         return await google_books(args["query"], args.get("num_results", 5))
 
     # ======================================================================
-    # VISION & OCR
+    # VISION & OCR (web)
     # ======================================================================
     if name == "google_lens":
         from tools.web_search import google_lens
@@ -1244,19 +1232,34 @@ async def _dispatch(name: str, args: dict) -> Any:
     # ======================================================================
     if name == "transcribe_video":
         from tools.web_search import transcribe_video
-        return await transcribe_video(args["url"], args.get("model_size", "tiny"), args.get("language", ""))
+        return await transcribe_video(
+            args["url"],
+            args.get("model_size", "tiny"),
+            args.get("language", ""),
+        )
 
     if name == "transcribe_local":
         from tools.web_search import transcribe_local
-        return await transcribe_local(args["path"], args.get("model_size", "tiny"), args.get("language", ""))
+        # web_search.py signature: transcribe_local(file_path, model_size, language)
+        return await transcribe_local(
+            args["file_path"],
+            args.get("model_size", "tiny"),
+            args.get("language", ""),
+        )
 
     if name == "search_transcript":
         from tools.web_search import search_transcript
-        return await search_transcript(args["url"], args["query"])
+        # web_search.py signature: search_transcript(url, keyword)
+        return await search_transcript(args["url"], args["keyword"])
 
     if name == "extract_video_clip":
         from tools.web_search import extract_video_clip
-        return await extract_video_clip(args["url"], args["start_time"], args["end_time"], args.get("output_path", ""))
+        # web_search.py signature: extract_video_clip(url, description, output_path)
+        return await extract_video_clip(
+            args["url"],
+            args["description"],
+            args.get("output_path", ""),
+        )
 
     if name == "convert_media":
         from tools.web_search import convert_media
@@ -1267,19 +1270,22 @@ async def _dispatch(name: str, args: dict) -> Any:
     # ======================================================================
     if name == "read_document":
         from tools.web_search import read_document
-        return await read_document(args["path"])
+        # web_search.py signature: read_document(file_path)
+        return await read_document(args["file_path"])
 
     # ======================================================================
     # EMAIL
     # ======================================================================
     if name == "fetch_emails":
         from tools.web_search import fetch_emails
+        # web_search.py signature: fetch_emails(email_address, password, server, port, num_emails, folder)
         return await fetch_emails(
-            args["email"], args["password"],
+            args["email_address"],
+            args["password"],
             server=args.get("server", ""),
             port=args.get("port", 993),
+            num_emails=args.get("num_emails", 10),
             folder=args.get("folder", "INBOX"),
-            limit=args.get("limit", 10),
         )
 
     # ======================================================================
@@ -1312,7 +1318,6 @@ async def _dispatch(name: str, args: dict) -> Any:
         from tools.web_search import upload_to_s3
         return await upload_to_s3(
             args["file_path"], args["bucket"],
-            key=args.get("key", ""),
             endpoint_url=args.get("endpoint_url", ""),
             access_key=args.get("access_key", ""),
             secret_key=args.get("secret_key", ""),
