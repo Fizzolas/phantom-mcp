@@ -1,96 +1,112 @@
 """
-OCR tool — read text from a screen region using Tesseract.
+tools/ocr.py — Screen OCR via Tesseract
 
-Why this exists:
-  Gemma 4B reads screenshot images, but JPEG compression + downscaling makes
-  small UI text (terminal output, file dialog paths, error codes, menu items)
-  unreliable to read visually. OCR converts those pixels to a clean string the
-  model can parse exactly.
+Requires:
+  pip install pytesseract Pillow mss
+  Tesseract binary installed: https://github.com/UB-Mannheim/tesseract/wiki
+  (Default install path on Windows: C:\\Program Files\\Tesseract-OCR\\tesseract.exe)
 
-Requires: pip install pytesseract pillow
-  AND Tesseract installed at C:\\Program Files\\Tesseract-OCR\\tesseract.exe
-  Download: https://github.com/UB-Mannheim/tesseract/wiki
-
-Usage:
-  region='full'           -> OCR the entire screen
-  region='x,y,width,height' -> OCR a sub-region (recommended — faster and more accurate)
+The first call will try to locate tesseract.exe automatically.
+If it is not on PATH, set TESSERACT_CMD in your .env or the code below.
 """
+from __future__ import annotations
 import asyncio
-import io
+import os
 from pathlib import Path
+from typing import Optional
 
-try:
-    import pytesseract
-    from PIL import Image
-    from mss import mss as MSS
-    HAS_OCR = True
-
-    # Auto-detect Tesseract on Windows default install path
-    _default_tess = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
-    if _default_tess.exists():
-        pytesseract.pytesseract.tesseract_cmd = str(_default_tess)
-except ImportError:
-    HAS_OCR = False
+_TESSERACT_SEARCHED = False
 
 
-def _parse_region(region: str, sct):
-    """Parse 'x,y,w,h' or return full monitor."""
-    if region == "full" or not region:
-        return sct.monitors[0]
-    try:
-        x, y, w, h = map(int, region.split(","))
-        return {"top": y, "left": x, "width": w, "height": h}
-    except (ValueError, TypeError):
-        return sct.monitors[0]
+def _ensure_tesseract() -> None:
+    global _TESSERACT_SEARCHED
+    if _TESSERACT_SEARCHED:
+        return
+    _TESSERACT_SEARCHED = True
+    import pytesseract  # type: ignore
+
+    # 1. Respect explicit env override
+    env_path = os.environ.get("TESSERACT_CMD", "")
+    if env_path and Path(env_path).is_file():
+        pytesseract.pytesseract.tesseract_cmd = env_path
+        return
+
+    # 2. Common default install paths (Windows)
+    default_paths = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    ]
+    for p in default_paths:
+        if Path(p).is_file():
+            pytesseract.pytesseract.tesseract_cmd = p
+            return
+
+    # 3. Leave as-is; if it is on PATH, pytesseract finds it automatically
 
 
 async def ocr_region(region: str = "full", lang: str = "eng") -> dict:
     """
-    Capture a screen region and return the OCR text.
+    Capture a screen region and extract text with Tesseract.
 
-    Args:
-        region: 'full' or 'x,y,width,height'
-        lang:   Tesseract language code (default 'eng')
+    region: 'full' or 'x,y,width,height'
+    lang:   Tesseract language code (default 'eng')
 
-    Returns:
-        {'text': <extracted text>, 'char_count': int, 'region': str}
-        or {'error': <message>} if Tesseract is unavailable.
+    Returns dict with keys:
+        text    — extracted text (stripped)
+        chars   — character count
+        region  — region string used
+        error   — present only if something went wrong
     """
-    if not HAS_OCR:
-        return {
-            "error": (
-                "pytesseract or Pillow not installed. "
-                "Run: pip install pytesseract pillow\n"
-                "Also install Tesseract: "
-                "https://github.com/UB-Mannheim/tesseract/wiki"
-            )
-        }
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _ocr_sync, region, lang)
 
-    def _run():
-        with MSS() as sct:
-            monitor = _parse_region(region, sct)
-            raw = sct.grab(monitor)
 
-        # Convert raw mss screenshot to PIL image
-        img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+def _ocr_sync(region: str, lang: str) -> dict:
+    try:
+        import mss  # type: ignore
+        from PIL import Image  # type: ignore
+        import pytesseract  # type: ignore
+    except ImportError as e:
+        return {"error": f"Missing dependency: {e}. Run: pip install pytesseract Pillow mss"}
 
-        # Upscale small regions 2x — Tesseract accuracy improves significantly
-        w, h = img.size
-        if w < 800:
-            img = img.resize((w * 2, h * 2), Image.LANCZOS)
-
-        # Run OCR
-        text = pytesseract.image_to_string(img, lang=lang)
-        return text.strip()
+    _ensure_tesseract()
 
     try:
-        text = await asyncio.to_thread(_run)
+        with mss.mss() as sct:
+            if region == "full":
+                mon = sct.monitors[1]  # primary monitor
+            else:
+                parts = [p.strip() for p in region.split(",")]
+                if len(parts) != 4:
+                    return {"error": "region must be 'full' or 'x,y,width,height'"}
+                x, y, w, h = [int(p) for p in parts]
+                mon = {"left": x, "top": y, "width": w, "height": h}
+
+            raw = sct.grab(mon)
+            img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+
+        # Tesseract works best on high-contrast images; scale up small regions
+        if img.width < 400:
+            scale = max(2, 400 // img.width)
+            img = img.resize(
+                (img.width * scale, img.height * scale),
+                Image.LANCZOS,  # type: ignore[attr-defined]
+            )
+
+        text = pytesseract.image_to_string(img, lang=lang)
+        text = text.strip()
         return {
             "text": text,
-            "char_count": len(text),
+            "chars": len(text),
             "region": region,
-            "note": "Empty result may mean the region contains no text or Tesseract path is wrong."
-            if not text else "",
+        }
+    except pytesseract.TesseractNotFoundError:
+        return {
+            "error": (
+                "Tesseract binary not found. Install from "
+                "https://github.com/UB-Mannheim/tesseract/wiki "
+                "or set the TESSERACT_CMD env variable to its full path."
+            )
         }
     except Exception as e:
         return {"error": str(e)}

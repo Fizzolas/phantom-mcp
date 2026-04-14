@@ -1,197 +1,194 @@
 """
-Shell tools — CMD, PowerShell, persistent CMD session, and run_python.
-Output is capped at MAX_OUTPUT_CHARS to prevent flooding the LLM context.
+tools/shell.py — Shell execution
 
-FIX (sweep-2):
-  - run_persistent_cmd: timeout was accepted but asyncio.wait_for was only
-    applied to readline, not the full send+receive cycle. Now each readline
-    has its own wait_for with the caller's timeout so the session resets
-    correctly on any hung command, not just the last line read.
-  - run_python: new tool — executes a Python snippet inside the server venv
-    and returns stdout/stderr. Avoids the write-file -> run -> delete pattern
-    for simple computations.
+Tools:
+  run_cmd            — one-shot CMD command
+  run_powershell     — one-shot PowerShell command
+  run_python         — run a Python snippet inside the server's own venv
+  run_persistent_cmd — CMD session that remembers cwd / env between calls
+  reset_persistent_cmd
+
+Output is capped at MAX_OUTPUT chars (8000). Text beyond that is truncated
+with a note so the model knows to use memory_chunk_save if it needs the full output.
 """
+from __future__ import annotations
+
 import asyncio
-import subprocess
+import io
 import sys
-import os
-import tempfile
-from typing import Optional
+import textwrap
+import traceback
+from contextlib import redirect_stderr, redirect_stdout
+from typing import Any
 
-MAX_OUTPUT_CHARS = 8000
+MAX_OUTPUT = 8_000
 
 
-def _truncate(text: str, label: str = "output") -> str:
-    if len(text) <= MAX_OUTPUT_CHARS:
+def _truncate(text: str, cap: int = MAX_OUTPUT) -> str:
+    if len(text) <= cap:
         return text
-    half = MAX_OUTPUT_CHARS // 2
+    half = cap // 2
     return (
         text[:half]
-        + f"\n\n... [{label} truncated — {len(text)} chars total, showing first+last {half}] ...\n\n"
+        + f"\n\n... [TRUNCATED — {len(text) - cap} chars omitted] ...\n\n"
         + text[-half:]
     )
 
 
+# =========================================================
+# One-shot CMD
+# =========================================================
 async def run_cmd(command: str, timeout: int = 30) -> dict:
-    """Run a single CMD command. Returns stdout, stderr, returncode."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _run_cmd_sync, command, timeout)
+
+
+def _run_cmd_sync(command: str, timeout: int) -> dict:
+    import subprocess
     try:
-        proc = await asyncio.create_subprocess_shell(
+        result = subprocess.run(
             command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
             shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+            errors="replace",
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         return {
-            "stdout": _truncate(stdout.decode(errors="replace"), "stdout"),
-            "stderr": _truncate(stderr.decode(errors="replace"), "stderr"),
-            "returncode": proc.returncode,
+            "stdout": _truncate(result.stdout),
+            "stderr": _truncate(result.stderr),
+            "returncode": result.returncode,
         }
-    except asyncio.TimeoutError:
+    except subprocess.TimeoutExpired:
         return {"error": f"Command timed out after {timeout}s", "returncode": -1}
     except Exception as e:
         return {"error": str(e), "returncode": -1}
 
 
+# =========================================================
+# One-shot PowerShell
+# =========================================================
 async def run_powershell(command: str, timeout: int = 30) -> dict:
-    """Run a PowerShell command or multi-line script block."""
-    ps_exe = "powershell.exe"
-    args = [ps_exe, "-NoProfile", "-NonInteractive", "-Command", command]
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _run_ps_sync, command, timeout)
+
+
+def _run_ps_sync(command: str, timeout: int) -> dict:
+    import subprocess
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+            errors="replace",
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         return {
-            "stdout": _truncate(stdout.decode(errors="replace"), "stdout"),
-            "stderr": _truncate(stderr.decode(errors="replace"), "stderr"),
-            "returncode": proc.returncode,
+            "stdout": _truncate(result.stdout),
+            "stderr": _truncate(result.stderr),
+            "returncode": result.returncode,
         }
-    except asyncio.TimeoutError:
+    except subprocess.TimeoutExpired:
         return {"error": f"PowerShell timed out after {timeout}s", "returncode": -1}
     except Exception as e:
         return {"error": str(e), "returncode": -1}
 
 
+# =========================================================
+# run_python — execute snippet in-process
+# =========================================================
 async def run_python(code: str, timeout: int = 30) -> dict:
     """
-    NEW (sweep-2): Execute a Python snippet inside the server's own venv.
-    Returns stdout, stderr, and returncode.
-    Avoids the write-file -> run-cmd -> delete dance for simple computations.
-    The code runs in a temp file so imports, multi-line scripts, and
-    print() calls all work correctly.
-    """
-    tmp = None
-    try:
-        # Write code to a temp file
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".py", delete=False, encoding="utf-8"
-        ) as f:
-            f.write(code)
-            tmp = f.name
+    Execute a Python snippet inside the Phantom server's own interpreter.
 
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, tmp,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+    - Runs in a fresh dict namespace (no cross-call state).
+    - stdout and stderr are captured and returned.
+    - Exceptions are caught and returned as stderr.
+    - Hard timeout via asyncio.wait_for wrapping a thread executor.
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, _run_python_sync, code),
+            timeout=timeout,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        return {
-            "stdout": _truncate(stdout.decode(errors="replace"), "stdout"),
-            "stderr": _truncate(stderr.decode(errors="replace"), "stderr"),
-            "returncode": proc.returncode,
-        }
+        return result
     except asyncio.TimeoutError:
         return {"error": f"Python snippet timed out after {timeout}s", "returncode": -1}
-    except Exception as e:
-        return {"error": str(e), "returncode": -1}
-    finally:
-        if tmp:
-            try:
-                os.unlink(tmp)
-            except Exception:
-                pass
 
 
-# --- Persistent CMD session ---
-_persistent_proc: Optional[asyncio.subprocess.Process] = None
-_persistent_lock = asyncio.Lock()
-SENTINEL = "__PHANTOM_CMD_DONE__"
+def _run_python_sync(code: str) -> dict:
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    ns: dict[str, Any] = {}
+    returncode = 0
+
+    try:
+        with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+            compiled = compile(textwrap.dedent(code), "<phantom_snippet>", "exec")
+            exec(compiled, ns)  # noqa: S102
+    except SystemExit as e:
+        returncode = e.code if isinstance(e.code, int) else 1
+    except Exception:
+        stderr_buf.write(traceback.format_exc())
+        returncode = 1
+
+    return {
+        "stdout": _truncate(stdout_buf.getvalue()),
+        "stderr": _truncate(stderr_buf.getvalue()),
+        "returncode": returncode,
+    }
 
 
-async def _get_persistent_proc() -> asyncio.subprocess.Process:
-    global _persistent_proc
-    if _persistent_proc is None or _persistent_proc.returncode is not None:
-        _persistent_proc = await asyncio.create_subprocess_shell(
-            "cmd.exe /Q",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-    return _persistent_proc
+# =========================================================
+# Persistent CMD session
+# =========================================================
+_PERSIST_PROC = None
+_PERSIST_LOCK = asyncio.Lock()
 
 
 async def run_persistent_cmd(command: str, timeout: int = 30) -> dict:
-    """
-    Run CMD in a persistent session that retains cwd and env between calls.
+    global _PERSIST_PROC
+    async with _PERSIST_LOCK:
+        if _PERSIST_PROC is None or _PERSIST_PROC.returncode is not None:
+            _PERSIST_PROC = await asyncio.create_subprocess_shell(
+                "cmd",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
 
-    FIX (sweep-2): Previously each readline() had its own wait_for(timeout),
-    but the total accumulated time across many lines could far exceed the
-    requested timeout. Now we track wall-clock deadline and stop reading once
-    the full timeout has elapsed, then reset the session.
-    """
-    async with _persistent_lock:
+        sentinel = "__PHANTOM_DONE__"
+        full_cmd = f"{command} && echo {sentinel}\n"
+        _PERSIST_PROC.stdin.write(full_cmd.encode("utf-8", errors="replace"))
+        await _PERSIST_PROC.stdin.drain()
+
+        output_lines: list[str] = []
         try:
-            proc = await _get_persistent_proc()
-            full_cmd = f"{command}\r\necho {SENTINEL}\r\n"
-            proc.stdin.write(full_cmd.encode())
-            await proc.stdin.drain()
-
-            lines = []
-            import time
-            deadline = time.monotonic() + timeout
-
             while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    # Timed out — reset session so next call is clean
-                    global _persistent_proc
-                    _persistent_proc = None
-                    return {"error": f"Persistent CMD timed out after {timeout}s", "returncode": -1}
-
-                line = await asyncio.wait_for(
-                    proc.stdout.readline(), timeout=min(remaining, 5.0)
+                line_bytes = await asyncio.wait_for(
+                    _PERSIST_PROC.stdout.readline(), timeout=timeout
                 )
-                decoded = line.decode(errors="replace").rstrip()
-                if SENTINEL in decoded:
+                line = line_bytes.decode("utf-8", errors="replace")
+                if sentinel in line:
                     break
-                lines.append(decoded)
-
-            output = _truncate("\n".join(lines), "output")
-            return {"stdout": output, "returncode": 0}
-
+                output_lines.append(line)
         except asyncio.TimeoutError:
-            _persistent_proc = None
             return {"error": f"Persistent CMD timed out after {timeout}s", "returncode": -1}
-        except Exception as e:
-            _persistent_proc = None
-            return {"error": str(e), "returncode": -1}
+
+        output = _truncate("".join(output_lines))
+        return {"stdout": output, "stderr": "", "returncode": 0}
 
 
 async def reset_persistent_cmd() -> dict:
-    """
-    Kill the persistent CMD session and start a fresh one.
-    Use when the session is stuck, in an unknown directory, or after a crash.
-    """
-    global _persistent_proc
-    async with _persistent_lock:
-        if _persistent_proc is not None and _persistent_proc.returncode is None:
+    global _PERSIST_PROC
+    async with _PERSIST_LOCK:
+        if _PERSIST_PROC and _PERSIST_PROC.returncode is None:
             try:
-                _persistent_proc.kill()
-                await _persistent_proc.wait()
+                _PERSIST_PROC.kill()
             except Exception:
                 pass
-        _persistent_proc = None
-    return {"ok": True, "message": "Persistent CMD session reset. Next run_persistent_cmd will start fresh."}
+        _PERSIST_PROC = None
+    return {"ok": True, "message": "Persistent CMD session reset"}
