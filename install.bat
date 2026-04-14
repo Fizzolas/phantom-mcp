@@ -8,68 +8,67 @@ echo  Phantom MCP - Auto Installer
 echo ============================================
 echo.
 
-REM --- Find available Python via py launcher ---
-echo Detecting Python versions...
-py -0 2>nul
+REM --- Check py launcher exists ---
+py --version >nul 2>&1
 IF ERRORLEVEL 1 (
-    echo [ERROR] Python Launcher (py.exe) not found.
+    echo [ERROR] Python Launcher ^(py.exe^) not found.
     echo Please install Python from https://www.python.org/downloads/
     echo Make sure to check "Add to PATH" and "Install py launcher".
     pause
     exit /b 1
 )
 
-REM --- Try preferred versions in order: 3.11, 3.12, 3.10, 3.13, default ---
-SET PYVER=
-FOR %%V IN (3.11 3.12 3.10 3.13) DO (
-    IF "!PYVER!"=="" (
-        py -%%V --version >nul 2>&1
-        IF NOT ERRORLEVEL 1 (
-            SET PYVER=%%V
-            echo Found Python %%V - using this version.
-        )
-    )
-)
-
-IF "!PYVER!"=="" (
-    echo No preferred version found, using default py...
-    SET PYCMD=py
-) ELSE (
-    SET PYCMD=py -!PYVER!
-)
-
-echo Using command: %PYCMD%
+echo Detecting Python versions...
+py -0
 echo.
 
-REM --- Upgrade pip first ---
+REM --- Try 3.11 first (best for AI/ML) ---
+SET PYCMD=
+CALL :TryVersion 3.11
+IF NOT "!PYCMD!"=="" GOTO :GotPython
+
+REM --- Try 3.12 ---
+CALL :TryVersion 3.12
+IF NOT "!PYCMD!"=="" GOTO :GotPython
+
+REM --- Try 3.10 ---
+CALL :TryVersion 3.10
+IF NOT "!PYCMD!"=="" GOTO :GotPython
+
+REM --- Try 3.13 ---
+CALL :TryVersion 3.13
+IF NOT "!PYCMD!"=="" GOTO :GotPython
+
+REM --- Try 3.14 ---
+CALL :TryVersion 3.14
+IF NOT "!PYCMD!"=="" GOTO :GotPython
+
+REM --- Fall back to default py ---
+echo No specific version matched, using default py...
+SET PYCMD=py
+
+:GotPython
+echo Using: %PYCMD%
+echo.
+
+REM --- Upgrade pip ---
 echo Upgrading pip...
 %PYCMD% -m pip install --upgrade pip
-IF ERRORLEVEL 1 (
-    echo [WARNING] pip upgrade failed, continuing anyway...
-)
-
-REM --- Install all requirements ---
 echo.
+
+REM --- Install requirements ---
 echo Installing Phantom MCP requirements...
 %PYCMD% -m pip install -r requirements.txt
 IF ERRORLEVEL 1 (
     echo.
     echo [ERROR] Some packages failed to install.
-    echo Try running this script as Administrator (right-click - Run as administrator)
+    echo Try right-clicking install.bat and choosing "Run as administrator"
     pause
     exit /b 1
 )
 
-REM --- Verify MCP installed ---
-%PYCMD% -m mcp --version >nul 2>&1
-IF ERRORLEVEL 1 (
-    echo [WARNING] mcp package verification failed. It may still work.
-) ELSE (
-    echo [OK] MCP framework verified.
-)
-
-REM --- Write which python command to use into a config file ---
-echo %PYCMD% > .python_cmd.txt
+REM --- Save the python command for launch.bat ---
+echo %PYCMD%> .python_cmd.txt
 
 echo.
 echo ============================================
@@ -77,3 +76,12 @@ echo  Installation complete!
 echo  Run launch.bat to start Phantom MCP.
 echo ============================================
 pause
+EXIT /B 0
+
+REM -----------------------------------------------
+:TryVersion
+py -%1 --version >nul 2>&1
+IF ERRORLEVEL 1 EXIT /B 0
+SET PYCMD=py -%1
+echo Found Python %1 - will use this version.
+EXIT /B 0
