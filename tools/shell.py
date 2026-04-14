@@ -1,15 +1,14 @@
 """
 Shell tools — CMD, PowerShell, and a persistent CMD session.
 Output is capped at MAX_OUTPUT_CHARS to prevent flooding the LLM context.
+
+FIX: reset_persistent_cmd added so the agent can recover from an unknown cwd.
 """
 import asyncio
 import subprocess
 import os
-import sys
 from typing import Optional
 
-# Cap shell output at this many characters before truncating.
-# A full terminal dump can easily be 50k+ chars -> token overflow.
 MAX_OUTPUT_CHARS = 8000
 
 
@@ -90,7 +89,6 @@ async def run_persistent_cmd(command: str, timeout: int = 30) -> dict:
     async with _persistent_lock:
         try:
             proc = await _get_persistent_proc()
-            # Write command then echo the sentinel so we know when output ends
             full_cmd = f"{command}\r\necho {SENTINEL}\r\n"
             proc.stdin.write(full_cmd.encode())
             await proc.stdin.drain()
@@ -106,7 +104,26 @@ async def run_persistent_cmd(command: str, timeout: int = 30) -> dict:
             output = _truncate("\n".join(lines), "output")
             return {"stdout": output, "returncode": 0}
         except asyncio.TimeoutError:
+            _persistent_proc = None  # reset on timeout so next call gets fresh session
             return {"error": f"Persistent CMD timed out after {timeout}s", "returncode": -1}
         except Exception as e:
-            _persistent_proc = None  # reset on error
+            _persistent_proc = None
             return {"error": str(e), "returncode": -1}
+
+
+async def reset_persistent_cmd() -> dict:
+    """
+    Kill the persistent CMD session and start a fresh one.
+    Resets cwd to whatever directory cmd.exe opens in by default.
+    Use when the session is stuck, in an unknown directory, or after a crash.
+    """
+    global _persistent_proc
+    async with _persistent_lock:
+        if _persistent_proc is not None and _persistent_proc.returncode is None:
+            try:
+                _persistent_proc.kill()
+                await _persistent_proc.wait()
+            except Exception:
+                pass
+        _persistent_proc = None
+    return {"ok": True, "message": "Persistent CMD session reset. Next run_persistent_cmd will start fresh."}

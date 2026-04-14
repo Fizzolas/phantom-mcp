@@ -1,12 +1,19 @@
 """
-File operations. read_file caps output at MAX_READ_CHARS to prevent context overflow.
+File operations.
+read_file caps output at MAX_READ_CHARS to prevent context overflow.
 Agents can write/delete files they created freely; user files require auth_guard approval.
+
+FIX: delete_file now uses asyncio.to_thread for shutil.rmtree so large directory
+trees don't block the entire async event loop.
+FIX: search_files now has a depth limit to prevent infinite loops on circular symlinks
+(common in Windows AppData junctions).
 """
+import asyncio
 import os
 from pathlib import Path
-from typing import Union
 
-MAX_READ_CHARS = 12000  # ~3000 tokens. Large files are head+tail truncated.
+MAX_READ_CHARS = 12000
+MAX_SEARCH_DEPTH = 20
 
 
 def _truncate(text: str) -> str:
@@ -78,16 +85,22 @@ async def list_dir(path: str) -> dict:
 
 
 async def delete_file(path: str) -> dict:
-    try:
+    """
+    FIX: shutil.rmtree is now run in asyncio.to_thread so it doesn't block
+    the event loop on large directory trees.
+    """
+    def _do_delete():
+        import shutil
         p = Path(path)
         if not p.exists():
             return {"error": f"Not found: {path}"}
         if p.is_dir():
-            import shutil
             shutil.rmtree(p)
         else:
             p.unlink()
         return {"ok": True, "deleted": str(p.resolve())}
+    try:
+        return await asyncio.to_thread(_do_delete)
     except Exception as e:
         return {"error": str(e)}
 
@@ -103,11 +116,29 @@ def file_exists(path: str) -> dict:
 
 
 async def search_files(root: str, pattern: str) -> dict:
-    try:
+    """
+    FIX: depth-limited walk to avoid infinite loops on Windows symlink junctions
+    (common in C:\\Users\\AppData and some node_modules trees).
+    Depth capped at MAX_SEARCH_DEPTH=20 levels.
+    """
+    def _search():
         p = Path(root)
         if not p.exists():
             return {"error": f"Root not found: {root}"}
-        matches = [str(f) for f in p.rglob(pattern)][:200]  # cap at 200 results
+        matches = []
+        root_depth = len(p.parts)
+        try:
+            for f in p.rglob(pattern):
+                if len(f.parts) - root_depth > MAX_SEARCH_DEPTH:
+                    continue
+                matches.append(str(f))
+                if len(matches) >= 200:
+                    break
+        except PermissionError:
+            pass
         return {"matches": matches, "count": len(matches), "capped": len(matches) == 200}
+
+    try:
+        return await asyncio.to_thread(_search)
     except Exception as e:
         return {"error": str(e)}

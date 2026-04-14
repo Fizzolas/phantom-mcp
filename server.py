@@ -60,6 +60,7 @@ TOOLS: list[types.Tool] = [
         name="screenshot",
         description=(
             "Capture the current screen as a compressed JPEG (max 1280px wide). "
+            "Returns as an image that vision-capable models can read. "
             "Use before any click or UI interaction to confirm element positions. "
             "Use region='x,y,w,h' to zoom into a specific area for small text."
         ),
@@ -210,6 +211,14 @@ TOOLS: list[types.Tool] = [
             "timeout": {"type": "integer", "default": 30}
         }}
     ),
+    types.Tool(
+        name="reset_persistent_cmd",
+        description=(
+            "Kill and restart the persistent CMD session, resetting cwd to the server root. "
+            "Use when the session is in an unknown state or stuck in a deep directory."
+        ),
+        inputSchema={"type": "object", "properties": {}}
+    ),
 
     # === FILES ===
     types.Tool(
@@ -261,7 +270,7 @@ TOOLS: list[types.Tool] = [
     ),
     types.Tool(
         name="search_files",
-        description="Search for files matching a glob pattern under a root directory. Returns up to 200 matches.",
+        description="Search for files matching a glob pattern under a root directory. Returns up to 200 matches. Depth-limited to 20 levels to avoid symlink loops.",
         inputSchema={"type": "object", "required": ["root", "pattern"], "properties": {
             "root": {"type": "string", "description": "Directory to search from"},
             "pattern": {"type": "string", "description": "Glob pattern, e.g. '*.py', '**/*.json', 'config*'"}
@@ -376,6 +385,21 @@ TOOLS: list[types.Tool] = [
         name="get_pc_snapshot",
         description="Returns live CPU% (total + per-core), RAM, swap, all disk drives, GPU VRAM/temp/load, and network IO. Call at session start.",
         inputSchema={"type": "object", "properties": {}}
+    ),
+
+    # === NOTIFY ===
+    types.Tool(
+        name="notify_user",
+        description=(
+            "Send a Windows desktop toast notification to the user. "
+            "Use when the goal is complete, when blocked and needing input, "
+            "or for any message that needs human attention without stopping work."
+        ),
+        inputSchema={"type": "object", "required": ["title", "message"], "properties": {
+            "title":    {"type": "string", "description": "Notification title, e.g. 'Phantom — Goal Complete'"},
+            "message":  {"type": "string", "description": "Body text of the notification"},
+            "duration": {"type": "integer", "description": "Seconds to show the toast (default 5)", "default": 5}
+        }}
     ),
 
     # === MEMORY: FACTS ===
@@ -571,7 +595,7 @@ async def list_tools() -> list[types.Tool]:
 # TOOL CALL HANDLER
 # =========================================================
 @app.call_tool()
-async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
+async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent | types.ImageContent]:
     log.info(f"TOOL CALL: {name} | args={json.dumps(arguments, default=str)[:300]}")
     try:
         result = await _dispatch(name, arguments)
@@ -580,6 +604,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
     except Exception as e:
         log.error(f"Tool {name} raised:\n{traceback.format_exc()}")
         result = {"error": type(e).__name__, "message": str(e)}
+
+    # Screenshot returns ImageContent directly
+    if isinstance(result, types.ImageContent):
+        log.info(f"TOOL RESULT [{name}]: <image data>")
+        return [result]
+
     text = result if isinstance(result, str) else json.dumps(result, indent=2, ensure_ascii=False, default=str)
     log.info(f"TOOL RESULT [{name}]: {text[:200]}")
     return [types.TextContent(type="text", text=text)]
@@ -591,7 +621,9 @@ async def _dispatch(name: str, args: dict) -> Any:
     if name == "screenshot":
         from tools.pc_vision import take_screenshot
         b64 = await take_screenshot(args.get("region", "full"))
-        return {"type": "image/jpeg;base64", "data": b64}
+        # FIX: return proper ImageContent so LM Studio vision models receive an actual image,
+        # not a JSON string wrapping base64 data.
+        return types.ImageContent(type="image", data=b64, mimeType="image/jpeg")
 
     if name == "get_screen_info":
         from tools.pc_vision import get_screen_info
@@ -657,7 +689,12 @@ async def _dispatch(name: str, args: dict) -> Any:
 
     if name == "run_persistent_cmd":
         from tools.shell import run_persistent_cmd
-        return await run_persistent_cmd(args["command"])
+        # FIX: timeout was previously dropped and never passed through.
+        return await run_persistent_cmd(args["command"], args.get("timeout", 30))
+
+    if name == "reset_persistent_cmd":
+        from tools.shell import reset_persistent_cmd
+        return await reset_persistent_cmd()
 
     # === FILES ===
     if name == "read_file":
@@ -749,6 +786,11 @@ async def _dispatch(name: str, args: dict) -> Any:
     if name == "get_pc_snapshot":
         from tools.pc_info import get_pc_snapshot
         return await get_pc_snapshot()
+
+    # === NOTIFY ===
+    if name == "notify_user":
+        from tools.notify import notify_user
+        return await notify_user(args["title"], args["message"], args.get("duration", 5))
 
     # === MEMORY: FACTS ===
     if name == "memory_save":     return mem.save(args["key"], args["value"])
