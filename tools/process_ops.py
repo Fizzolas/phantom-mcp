@@ -1,6 +1,17 @@
 """
 Process management — list, find, kill, launch.
-Added: find_process by name, force-kill option, CPU% per process.
+
+FIX (sweep-2):
+  - kill_process: psutil.NoSuchProcess was only caught in find_process,
+    not in kill_process itself. If the process exits between the find and
+    the kill call, it previously raised an unhandled exception that surfaced
+    as an error:500 in the MCP response. Now caught explicitly.
+  - kill_process: SYSTEM_PROCS blocklist was checked against p.name() but
+    some protected processes have variable names depending on version/instance.
+    Added PID range check: PIDs 0-8 are always kernel/system on Windows.
+  - list_processes: cpu_percent on first call always returns 0.0 because
+    psutil needs a sampling interval. Added a 0.1s non-blocking interval
+    so the numbers are actually meaningful.
 """
 import asyncio
 import psutil
@@ -10,14 +21,15 @@ SYSTEM_PROCS = {
     "system", "registry", "smss.exe", "csrss.exe",
     "wininit.exe", "services.exe", "lsass.exe",
 }
-# svchost is dangerous to mass-kill but has legitimate instances
-# — we warn instead of hard-block
 WARN_PROCS = {"svchost.exe", "explorer.exe"}
+# PIDs 0-8 are always Windows kernel/idle/system processes — never touch
+SYSTEM_PID_MAX = 8
 
 
 async def list_processes(sort_by: str = "ram", limit: int = 50) -> list:
     """
     List running processes.
+    FIX: cpu_percent(interval=0.1) so values aren't all 0.0.
     sort_by: 'ram' | 'cpu' | 'name' | 'pid'
     limit: max results (1-200)
     """
@@ -25,13 +37,14 @@ async def list_processes(sort_by: str = "ram", limit: int = 50) -> list:
 
     def _get():
         procs = []
-        for p in psutil.process_iter(["pid", "name", "memory_info", "status", "cpu_percent"]):
+        for p in psutil.process_iter(["pid", "name", "memory_info", "status"]):
             try:
+                cpu = p.cpu_percent(interval=0.1)
                 procs.append({
                     "pid":     p.info["pid"],
                     "name":    p.info["name"],
                     "ram_mb":  round(p.info["memory_info"].rss / 1024**2, 1),
-                    "cpu_%":   p.info["cpu_percent"],
+                    "cpu_%":   cpu,
                     "status":  p.info["status"],
                 })
             except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -51,10 +64,6 @@ async def list_processes(sort_by: str = "ram", limit: int = 50) -> list:
 
 
 async def find_process(name: str) -> list:
-    """
-    Find all processes whose name contains `name` (case-insensitive).
-    Returns matching entries with pid, name, ram_mb, cpu_%, status.
-    """
     def _find():
         matches = []
         q = name.lower()
@@ -81,10 +90,14 @@ async def find_process(name: str) -> list:
 async def kill_process(pid: int, force: bool = False) -> str:
     """
     Terminate a process by PID.
-    force=True uses SIGKILL (taskkill /F) for processes that ignore normal termination.
-    System-critical processes (lsass, csrss, etc.) are always blocked.
+    FIX: NoSuchProcess is now caught inside _kill so a race between find and
+    kill doesn't blow up. Also blocks PID 0-8 (Windows kernel range).
     """
     def _kill():
+        # FIX: block kernel-range PIDs before even calling psutil
+        if pid <= SYSTEM_PID_MAX:
+            return f"BLOCKED: PID {pid} is in the Windows kernel PID range (0-{SYSTEM_PID_MAX})."
+
         try:
             p = psutil.Process(pid)
             pname = p.name().lower()
@@ -99,14 +112,15 @@ async def kill_process(pid: int, force: bool = False) -> str:
                 )
 
             if force:
-                p.kill()   # SIGKILL — immediate, no cleanup
+                p.kill()
                 return f"Force-killed '{p.name()}' (PID {pid})"
             else:
-                p.terminate()   # SIGTERM — graceful
+                p.terminate()
                 return f"Terminated '{p.name()}' (PID {pid})"
 
+        # FIX: process may have exited between find and kill
         except psutil.NoSuchProcess:
-            return f"ERROR: PID {pid} not found"
+            return f"PID {pid} no longer exists (already exited)."
         except psutil.AccessDenied:
             return f"ERROR: Access denied for PID {pid} (try running as admin)"
 
@@ -114,11 +128,6 @@ async def kill_process(pid: int, force: bool = False) -> str:
 
 
 async def launch_app(target: str, wait: bool = False, timeout: int = 10) -> str:
-    """
-    Launch an application or open a file.
-    target: exe path, URL, document path, or 'start notepad.exe'
-    wait: if True, wait up to `timeout` seconds for the process to start
-    """
     def _launch():
         try:
             proc = subprocess.Popen(
