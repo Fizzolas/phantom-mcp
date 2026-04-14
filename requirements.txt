@@ -1,6 +1,6 @@
-# Phantom MCP - Python dependencies
-# Install with: py -3.X -m pip install -r requirements.txt
-# Replace 3.X with your Python version (run: py -0 to list)
+# Phantom MCP — Python dependencies
+# Install with: pip install -r requirements.txt
+# Python 3.10+ required
 
 # MCP framework
 mcp>=1.0.0
@@ -15,17 +15,18 @@ Pillow>=10.0.0
 # Mouse & keyboard control
 pyautogui>=0.9.54
 
+# Clipboard (also used by keyboard_type for special-char fallback)
+pyperclip>=1.8.2
+
 # Process management
 psutil>=5.9.0
 
 # Window management
 pygetwindow>=0.0.9
 
-# Clipboard
-pyperclip>=1.8.2
-
 # System tray icon
 pystray>=0.19.5
 
-# GPU monitoring (optional but recommended)
-# gputil>=1.4.0
+# GPU monitoring — required for full get_pc_snapshot GPU data
+# If not installed, GPU info degrades gracefully to name-only
+gputil>=1.4.0
