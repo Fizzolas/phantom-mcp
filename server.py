@@ -3,6 +3,12 @@ Phantom MCP Server
 Full MCP server for LM Studio. Routes tool calls to PC control modules.
 Goal engine runs continuously until task is complete.
 File auth guard blocks edits to user files without approval.
+
+Sweep-2 changes:
+  - Added 'ocr' tool (screen region text extraction via Tesseract)
+  - Added 'run_python' tool (run Python snippets directly in server venv)
+  - goal_status 'complete' now fires notify_user automatically
+  - goal_status 'blocked' also fires notify_user so you notice without watching logs
 """
 import asyncio
 import json
@@ -76,6 +82,28 @@ TOOLS: list[types.Tool] = [
         name="get_screen_info",
         description="Returns screen resolution and screenshot compression settings. Call once per session to know coordinate bounds.",
         inputSchema={"type": "object", "properties": {}}
+    ),
+    types.Tool(
+        name="ocr",
+        description=(
+            "Read text from the screen using OCR (Tesseract). "
+            "Use when screenshot-based visual reading is unreliable — small text, "
+            "terminal output, file dialog paths, error messages. "
+            "Much more accurate than trying to read compressed JPEG screenshots. "
+            "Requires Tesseract installed (see README)."
+        ),
+        inputSchema={"type": "object", "properties": {
+            "region": {
+                "type": "string",
+                "description": "'full' for full screen, or 'x,y,width,height' to read a sub-region (recommended for speed and accuracy)",
+                "default": "full"
+            },
+            "lang": {
+                "type": "string",
+                "description": "Tesseract language code (default 'eng')",
+                "default": "eng"
+            }
+        }}
     ),
 
     # === MOUSE ===
@@ -201,6 +229,20 @@ TOOLS: list[types.Tool] = [
         }}
     ),
     types.Tool(
+        name="run_python",
+        description=(
+            "Execute a Python snippet directly inside the Phantom server venv. "
+            "Returns stdout, stderr, and returncode. "
+            "Use for quick calculations, data parsing, file transformations, or anything "
+            "that is easier to write as Python than as a shell command. "
+            "Multi-line scripts and imports work. Do NOT use for GUI or long-running tasks."
+        ),
+        inputSchema={"type": "object", "required": ["code"], "properties": {
+            "code": {"type": "string", "description": "Python source code to execute"},
+            "timeout": {"type": "integer", "description": "Max seconds (default 30)", "default": 30}
+        }}
+    ),
+    types.Tool(
         name="run_persistent_cmd",
         description=(
             "Run CMD in a persistent session that remembers cwd and env between calls. "
@@ -225,6 +267,7 @@ TOOLS: list[types.Tool] = [
         name="read_file",
         description=(
             "Read a file's contents. Output capped at 12000 chars (shows head+tail if truncated). "
+            "Binary files (exe, zip, png, etc.) return an error with a hint. "
             "If 'truncated' is true in the response, use memory_chunk_save to store it in chunks instead."
         ),
         inputSchema={"type": "object", "required": ["path"], "properties": {
@@ -270,7 +313,7 @@ TOOLS: list[types.Tool] = [
     ),
     types.Tool(
         name="search_files",
-        description="Search for files matching a glob pattern under a root directory. Returns up to 200 matches. Depth-limited to 20 levels to avoid symlink loops.",
+        description="Search for files matching a glob pattern under a root directory. Returns up to 200 matches. Depth-limited to 20 levels and protected against symlink loops.",
         inputSchema={"type": "object", "required": ["root", "pattern"], "properties": {
             "root": {"type": "string", "description": "Directory to search from"},
             "pattern": {"type": "string", "description": "Glob pattern, e.g. '*.py', '**/*.json', 'config*'"}
@@ -298,7 +341,7 @@ TOOLS: list[types.Tool] = [
         description=(
             "Terminate a process by PID. "
             "Set force=true to SIGKILL processes that ignore normal termination. "
-            "System-critical processes (lsass, csrss, etc.) are always blocked."
+            "System-critical processes (lsass, csrss, kernel PIDs 0-8) are always blocked."
         ),
         inputSchema={"type": "object", "required": ["pid"], "properties": {
             "pid": {"type": "integer"},
@@ -323,7 +366,11 @@ TOOLS: list[types.Tool] = [
     ),
     types.Tool(
         name="focus_window",
-        description="Bring a window to the foreground. Restores it from minimized state first if needed. Partial title match.",
+        description=(
+            "Bring a window to the foreground. Uses AttachThreadInput so the window actually "
+            "receives focus on Windows 10/11 instead of just flashing in the taskbar. "
+            "Restores minimized windows first. Partial title match."
+        ),
         inputSchema={"type": "object", "required": ["title"], "properties": {
             "title": {"type": "string", "description": "Partial window title to match"}
         }}
@@ -396,7 +443,7 @@ TOOLS: list[types.Tool] = [
             "or for any message that needs human attention without stopping work."
         ),
         inputSchema={"type": "object", "required": ["title", "message"], "properties": {
-            "title":    {"type": "string", "description": "Notification title, e.g. 'Phantom — Goal Complete'"},
+            "title":    {"type": "string", "description": "Notification title, e.g. 'Phantom \u2014 Goal Complete'"},
             "message":  {"type": "string", "description": "Body text of the notification"},
             "duration": {"type": "integer", "description": "Seconds to show the toast (default 5)", "default": 5}
         }}
@@ -571,8 +618,8 @@ TOOLS: list[types.Tool] = [
         name="goal_status",
         description=(
             "Report goal progress. Always call at the end of each work loop iteration. "
-            "'in_progress' = keep working. 'complete' = goal verified done. "
-            "'blocked' = need user input (describe in blocker field)."
+            "'in_progress' = keep working. 'complete' = goal verified done (auto-notifies user). "
+            "'blocked' = need user input — describe in blocker field (auto-notifies user)."
         ),
         inputSchema={"type": "object", "required": ["status", "summary"], "properties": {
             "status":  {"type": "string", "enum": ["in_progress", "complete", "blocked"]},
@@ -621,13 +668,15 @@ async def _dispatch(name: str, args: dict) -> Any:
     if name == "screenshot":
         from tools.pc_vision import take_screenshot
         b64 = await take_screenshot(args.get("region", "full"))
-        # FIX: return proper ImageContent so LM Studio vision models receive an actual image,
-        # not a JSON string wrapping base64 data.
         return types.ImageContent(type="image", data=b64, mimeType="image/jpeg")
 
     if name == "get_screen_info":
         from tools.pc_vision import get_screen_info
         return get_screen_info()
+
+    if name == "ocr":
+        from tools.ocr import ocr_region
+        return await ocr_region(args.get("region", "full"), args.get("lang", "eng"))
 
     # === MOUSE ===
     if name == "mouse_move":
@@ -687,9 +736,12 @@ async def _dispatch(name: str, args: dict) -> Any:
         from tools.shell import run_powershell
         return await run_powershell(args["command"], args.get("timeout", 30))
 
+    if name == "run_python":
+        from tools.shell import run_python
+        return await run_python(args["code"], args.get("timeout", 30))
+
     if name == "run_persistent_cmd":
         from tools.shell import run_persistent_cmd
-        # FIX: timeout was previously dropped and never passed through.
         return await run_persistent_cmd(args["command"], args.get("timeout", 30))
 
     if name == "reset_persistent_cmd":
@@ -839,10 +891,32 @@ async def _dispatch(name: str, args: dict) -> Any:
         if blocker:
             entry["blocker"] = blocker
         mem.save("__last_goal_status", json.dumps(entry))
+
+        # FIX (sweep-2): complete and blocked both fire a desktop notification
+        # so you know the agent needs attention without watching the terminal.
         if status == "blocked":
             log.warning(f"GOAL BLOCKED: {blocker}")
+            try:
+                from tools.notify import notify_user
+                await notify_user(
+                    "Phantom — Blocked",
+                    f"{blocker[:200]}" if blocker else summary[:200],
+                    duration=10,
+                )
+            except Exception:
+                pass
         elif status == "complete":
             log.info(f"GOAL COMPLETE: {summary}")
+            try:
+                from tools.notify import notify_user
+                await notify_user(
+                    "Phantom — Goal Complete ✅",
+                    summary[:200],
+                    duration=8,
+                )
+            except Exception:
+                pass
+
         return entry
 
     return {"error": f"Unknown tool: '{name}'"}

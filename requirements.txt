@@ -1,32 +1,34 @@
 # Phantom MCP — Python dependencies
 # Install with: pip install -r requirements.txt
-# Python 3.10+ required
 
 # MCP framework
 mcp>=1.0.0
 
-# HTTP client (memory compression calls LM Studio API)
-httpx>=0.27.0
-
 # Screen capture
-mss>=9.0.1
+mss>=9.0.0
+
+# Image processing (screenshots + OCR preprocessing)
 Pillow>=10.0.0
 
 # Mouse & keyboard control
 pyautogui>=0.9.54
-
-# Clipboard (also used by keyboard_type for special-char fallback)
 pyperclip>=1.8.2
-
-# Process management
-psutil>=5.9.0
 
 # Window management
 pygetwindow>=0.0.9
 
-# System tray icon
-pystray>=0.19.5
+# Win32 API — for AttachThreadInput focus fix + tray icon
+pywin32>=306
 
-# GPU monitoring — required for full get_pc_snapshot GPU data
-# If not installed, GPU info degrades gracefully to name-only
-gputil>=1.4.0
+# System info (CPU, RAM, GPU)
+psutil>=5.9.0
+
+# Async HTTP (memory compress calls LM Studio API)
+httpx>=0.27.0
+
+# Desktop notifications
+win10toast>=0.9
+
+# OCR (optional but recommended — needed for 'ocr' tool)
+# Also requires Tesseract binary: https://github.com/UB-Mannheim/tesseract/wiki
+pytesseract>=0.3.10
