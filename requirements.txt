@@ -1,0 +1,14 @@
+# Phantom MCP Server requirements
+# Run: pip install -r requirements.txt
+# Only pystray and pygetwindow are missing on FizzBeast
+mcp>=1.26.0
+pyautogui>=0.9.54
+pygetwindow>=0.0.9
+mss>=10.0.0
+Pillow>=10.0.0
+psutil>=6.0.0
+GPUtil>=1.4.0
+httpx>=0.28.0
+fastapi>=0.115.0
+pystray>=0.19.5
+keyboard>=0.13.5
