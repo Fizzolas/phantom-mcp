@@ -7,6 +7,11 @@ of just flashing it in the taskbar. Without this, every click after focus_window
 lands on the wrong window.
 
 Added: get_window_rect, resize_window, move_window, restore_window.
+
+FIX (sweep-4): focus_window now returns a dict instead of a bare string so
+callers can detect failure. Adds strict=True exact-match mode. On failure,
+returns available_titles so the model can retry with the correct name without
+an extra list_windows round-trip.
 """
 import asyncio
 import ctypes
@@ -101,18 +106,31 @@ async def list_windows() -> list:
     return await asyncio.to_thread(_get)
 
 
-async def focus_window(title: str) -> str:
+async def focus_window(title: str, strict: bool = False) -> dict:
     """
     Bring a window to the foreground.
+    strict=True  → only exact title matches accepted.
+    strict=False → case-insensitive substring match (default).
+    Returns a dict so callers can detect failure and see available_titles.
     FIX: Uses AttachThreadInput path via _force_foreground() so the window
     actually gets focus on Windows 10/11 (not just a taskbar flash).
     Falls back to pygetwindow.activate() if win32gui is unavailable.
     """
     if not HAS_GW:
-        return str(_no_gw())
-    matches = _find(title)
+        return {"ok": False, "error": "pygetwindow not available. Run: pip install pygetwindow"}
+    all_windows = [w for w in gw.getAllWindows() if w.title.strip()]
+    available_titles = [w.title for w in all_windows]
+    if strict:
+        matches = [w for w in all_windows if w.title == title]
+    else:
+        matches = [w for w in all_windows if title.lower() in w.title.lower()]
     if not matches:
-        return f"No window found matching: '{title}'"
+        return {
+            "ok": False,
+            "matched_title": None,
+            "available_titles": available_titles,
+            "_hint": "Call list_windows to get current titles and retry with the exact string.",
+        }
     w = matches[0]
     try:
         if w.isMinimized:
@@ -120,17 +138,20 @@ async def focus_window(title: str) -> str:
             await asyncio.sleep(0.2)
 
         if HAS_WIN32:
-            # Get the real HWND from pygetwindow and use the reliable force path
             hwnd = w._hWnd if hasattr(w, "_hWnd") else win32gui.FindWindow(None, w.title)
             if hwnd and _force_foreground(hwnd):
                 await asyncio.sleep(0.1)
-                return f"Focused (win32): '{w.title}'"
+                return {"ok": True, "focused": w.title, "method": "win32"}
 
-        # Fallback to pygetwindow activate
         w.activate()
-        return f"Focused (gw): '{w.title}'"
+        return {"ok": True, "focused": w.title, "method": "pygetwindow"}
     except Exception as e:
-        return f"Focus failed for '{w.title}': {e}"
+        return {
+            "ok": False,
+            "focused": None,
+            "error": f"Focus failed for '{w.title}': {e}",
+            "available_titles": available_titles,
+        }
 
 
 def get_active_window() -> dict:
