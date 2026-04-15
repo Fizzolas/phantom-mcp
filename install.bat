@@ -70,6 +70,31 @@ IF ERRORLEVEL 1 (
 REM --- Save the python command for launch.bat ---
 echo %PYCMD%> .python_cmd.txt
 
+REM --- Check for Node.js / npm (required for google-search MCP plugin) ---
+echo.
+echo Checking for Node.js and npm (required for google-search plugin)...
+where npm >nul 2>&1
+IF ERRORLEVEL 1 (
+    echo [WARNING] npm not found. The google-search MCP plugin will not work.
+    echo Download Node.js from https://nodejs.org/ and re-run install.bat.
+) ELSE (
+    echo npm found. Checking for noapi-google-search-mcp...
+    where noapi-google-search-mcp >nul 2>&1
+    IF ERRORLEVEL 1 (
+        echo noapi-google-search-mcp not found. Installing globally via npm...
+        npm install -g noapi-google-search-mcp
+        IF ERRORLEVEL 1 (
+            echo [ERROR] Failed to install noapi-google-search-mcp.
+            echo Try running: npm install -g noapi-google-search-mcp
+            echo as Administrator in a separate terminal, then re-run install.bat.
+        ) ELSE (
+            echo noapi-google-search-mcp installed successfully.
+        )
+    ) ELSE (
+        echo noapi-google-search-mcp is already installed and on PATH. OK.
+    )
+)
+
 echo.
 echo ============================================
 echo  Installation complete!
