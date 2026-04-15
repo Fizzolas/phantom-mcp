@@ -12,6 +12,10 @@ FIX (sweep-2):
     now skipped gracefully instead of crashing the whole listing.
   - read_file: binary file detection — returns a clear error instead of a
     garbled UnicodeDecodeError when the agent accidentally tries to read an exe/zip.
+
+FIX (sweep-4):
+  - read_dir_tree: truncation string had literal embedded newlines (SyntaxError).
+    Replaced with proper \n escape sequences.
 """
 import asyncio
 import os
@@ -178,3 +182,65 @@ async def search_files(root: str, pattern: str) -> dict:
         return await asyncio.to_thread(_search)
     except Exception as e:
         return {"error": str(e)}
+
+
+def read_dir_tree(root: str, pattern: str = "**/*", max_files: int = 10) -> dict:
+    """
+    List all entries under `root` matching `pattern` and return the text
+    contents of up to `max_files` matching files in one call.
+
+    Use instead of list_dir + multiple read_file calls when you need to
+    understand the full contents of a folder in one step.
+
+    Returns:
+      ok        : bool
+      root      : resolved root path
+      pattern   : glob pattern used
+      tree      : list of {path, type, size?} for every entry
+      contents  : {relative_path: text} for up to max_files readable files
+      _hint     : model guidance hint
+
+    FIX (sweep-4): truncation string used literal embedded newlines which
+    caused a SyntaxError on import. Now uses proper escape sequences.
+    """
+    base = Path(root)
+    if not base.exists():
+        return {"ok": False, "error": f"Root not found: {root}"}
+
+    entries = []
+    contents = {}
+    matched = []
+    for p in sorted(base.glob(pattern)):
+        try:
+            rel = str(p.relative_to(base))
+        except Exception:
+            rel = str(p)
+        if p.is_dir():
+            entries.append({"path": rel, "type": "dir"})
+        else:
+            entries.append({"path": rel, "type": "file", "size": p.stat().st_size})
+            matched.append(p)
+
+    for p in matched[:max_files]:
+        try:
+            rel = str(p.relative_to(base))
+        except Exception:
+            rel = str(p)
+        try:
+            text = p.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            contents[rel] = "<binary or non-utf8 file>"
+            continue
+        if len(text) > 12000:
+            text = text[:6000] + "\n\n...[truncated]...\n\n" + text[-6000:]
+        contents[rel] = text
+
+    return {
+        "ok": True,
+        "root": str(base),
+        "pattern": pattern,
+        "max_files": max_files,
+        "tree": entries,
+        "contents": contents,
+        "_hint": "Review contents and continue reading relevant files if the goal is not complete."
+    }
