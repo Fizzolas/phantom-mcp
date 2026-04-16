@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Phantom runtime
+data/memory.json
+logs/*.log
+logs/*.jsonl
+
+# Editors
+.vscode/
+.idea/
+*.swp
