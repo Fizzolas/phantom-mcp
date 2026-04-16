@@ -23,8 +23,8 @@ loaded. Every design decision optimizes for:
 | PR  | Scope                                                                            | Status |
 | --- | -------------------------------------------------------------------------------- | ------ |
 | 1   | Contracts + registry + capability probe. Migrate 5 proof tools.                  | shipped ✓ |
-| 2   | Memory adapter + task state machine. Un-expose chunk_* tools.                    | **this PR** |
-| 3   | Migrate remaining tools. Delete ghost modules. Regenerate README + SYSTEM_PROMPT. | pending |
+| 2   | Memory adapter + task state machine. Un-expose chunk_* tools.                    | shipped ✓ |
+| 3   | Migrate remaining tools. Remove ghost imports. Regenerate README + SYSTEM_PROMPT. | **this PR** |
 | 4   | Planner loop, fallback chains, token-budget integration, LM Studio probe wiring. | pending |
 | 5   | Tests (unit, contract, chaos), pyproject, launcher cleanup, observability.       | pending |
 
