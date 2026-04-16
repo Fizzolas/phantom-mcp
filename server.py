@@ -1124,7 +1124,6 @@ async def list_tools() -> list[types.Tool]:
         _tools_list_logged = True
     return TOOLS
 
-
 # ==========================================================================
 # DISPATCH
 # ==========================================================================
@@ -1248,38 +1247,6 @@ async def _dispatch(name: str, args: dict) -> Any:
         from tools.web_search import linkedin_search
         return await asyncio.to_thread(linkedin_search, args["query"], args.get("search_type", "people"))
 
-    # ---- system & shell ----
-    if name == "run_cmd":
-        from tools.system_ops import run_cmd
-        return await run_cmd(args["command"], args.get("timeout", 30))
-    if name == "run_powershell":
-        from tools.system_ops import run_powershell
-        return await run_powershell(args["script"], args.get("timeout", 60))
-    if name == "run_python":
-        from tools.system_ops import run_python
-        return await run_python(args["code"], args.get("timeout", 60))
-    if name == "process_list":
-        from tools.system_ops import process_list
-        return await process_list(args.get("filter", ""))
-    if name == "kill_process":
-        from tools.system_ops import kill_process
-        return await kill_process(args["target"])
-    if name == "system_info":
-        from tools.system_ops import system_info
-        return await asyncio.to_thread(system_info)
-    if name == "get_env":
-        from tools.system_ops import get_env
-        return get_env(args.get("key", ""))
-    if name == "set_env":
-        from tools.system_ops import set_env
-        return set_env(args["key"], args["value"])
-    if name == "get_clipboard":
-        from tools.system_ops import get_clipboard
-        return get_clipboard()
-    if name == "set_clipboard":
-        from tools.system_ops import set_clipboard
-        return set_clipboard(args["text"])
-
     # ---- file system ----
     if name == "read_file":
         from tools.file_ops import read_file
@@ -1310,9 +1277,6 @@ async def _dispatch(name: str, args: dict) -> Any:
     if name == "file_exists":
         from tools.file_ops import file_exists
         return file_exists(args["path"])
-    if name == "read_document":
-        from tools.document_ops import read_document
-        return await asyncio.to_thread(read_document, args["path"])
 
     # ---- window management ----
     if name == "list_windows":
@@ -1346,52 +1310,10 @@ async def _dispatch(name: str, args: dict) -> Any:
         from tools.window_ops import move_window
         return await move_window(args["title"], args["x"], args["y"])
 
-    # ---- mouse & keyboard ----
-    if name == "mouse_click":
-        from tools.input_ops import mouse_click
-        return await mouse_click(args["x"], args["y"], args.get("button", "left"), args.get("double", False))
-    if name == "mouse_move":
-        from tools.input_ops import mouse_move
-        return await mouse_move(args["x"], args["y"])
-    if name == "mouse_scroll":
-        from tools.input_ops import mouse_scroll
-        return await mouse_scroll(args["clicks"])
-    if name == "mouse_drag":
-        from tools.input_ops import mouse_drag
-        return await mouse_drag(args["x1"], args["y1"], args["x2"], args["y2"], args.get("button", "left"))
-    if name == "keyboard_type":
-        from tools.input_ops import keyboard_type
-        result = await keyboard_type(args["text"], args.get("interval", 0.02))
-        return result
-    if name == "keyboard_hotkey":
-        from tools.input_ops import keyboard_hotkey
-        return await keyboard_hotkey(args["keys"])
-    if name == "take_screenshot":
-        from tools.input_ops import take_screenshot
-        return await take_screenshot(args["output_path"], args.get("region"))
-    if name == "find_on_screen":
-        from tools.input_ops import find_on_screen
-        return await find_on_screen(args["target"], args.get("confidence", 0.8))
-    if name == "ocr_screen":
-        from tools.input_ops import ocr_screen
-        return await ocr_screen(args.get("region"))
-
     # ---- audio / media / notifications ----
-    if name == "text_to_speech":
-        from tools.media_ops import text_to_speech
-        return await asyncio.to_thread(text_to_speech, args["text"], args.get("voice", ""))
-    if name == "play_audio":
-        from tools.media_ops import play_audio
-        return await asyncio.to_thread(play_audio, args["path"])
-    if name == "record_audio":
-        from tools.media_ops import record_audio
-        return await asyncio.to_thread(record_audio, args["output_path"], args["duration"])
     if name == "transcribe_local":
         from tools.web_search import transcribe_local
         return await asyncio.to_thread(transcribe_local, file_path=args["file_path"])
-    if name == "show_notification":
-        from tools.media_ops import show_notification
-        return await asyncio.to_thread(show_notification, args["title"], args["message"], args.get("duration", 5))
 
     # ---- memory ----
     if name == "memory_store":
@@ -1448,62 +1370,6 @@ async def _dispatch(name: str, args: dict) -> Any:
             ),
         }
 
-    # ---- code & dev ----
-    if name == "git_command":
-        from tools.system_ops import git_command
-        return await git_command(args["repo_path"], args["command"])
-    if name == "pip_install":
-        from tools.system_ops import pip_install
-        return await pip_install(args["packages"])
-    if name == "npm_command":
-        from tools.system_ops import npm_command
-        return await npm_command(args["project_path"], args["command"])
-    if name == "start_dev_server":
-        from tools.system_ops import start_dev_server
-        return await start_dev_server(args["project_path"], args["command"], args.get("port", 3000))
-
-    # ---- image / vision ----
-    if name == "analyze_image":
-        from tools.vision_ops import analyze_image
-        return await asyncio.to_thread(analyze_image, args["path"], args.get("query", ""))
-    if name == "generate_image":
-        from tools.vision_ops import generate_image
-        return await asyncio.to_thread(generate_image, args["prompt"], args["output_path"], args.get("width", 1024), args.get("height", 1024))
-    if name == "convert_image":
-        from tools.vision_ops import convert_image
-        return await asyncio.to_thread(convert_image, args["input_path"], args["output_path"])
-    if name == "resize_image":
-        from tools.vision_ops import resize_image
-        return await asyncio.to_thread(resize_image, args["input_path"], args["output_path"], args["width"], args["height"])
-
-    # ---- browser automation ----
-    if name == "browser_open":
-        from tools.browser_ops import browser_open
-        return await browser_open(args["url"], args.get("headless", True))
-    if name == "browser_click":
-        from tools.browser_ops import browser_click
-        return await browser_click(args["selector"], args.get("selector_type", "css"))
-    if name == "browser_type":
-        from tools.browser_ops import browser_type
-        return await browser_type(args["selector"], args["text"], args.get("selector_type", "css"))
-    if name == "browser_get_html":
-        from tools.browser_ops import browser_get_html
-        return await browser_get_html()
-    if name == "browser_screenshot":
-        from tools.browser_ops import browser_screenshot
-        return await browser_screenshot(args["output_path"])
-    if name == "browser_execute_js":
-        from tools.browser_ops import browser_execute_js
-        return await browser_execute_js(args["script"])
-
-    # ---- database ----
-    if name == "db_query":
-        from tools.db_ops import db_query
-        return await asyncio.to_thread(db_query, args["db_path"], args["query"])
-    if name == "db_execute":
-        from tools.db_ops import db_execute
-        return await asyncio.to_thread(db_execute, args["db_path"], args["statement"], args.get("parameters", []))
-
     # ---- networking & API ----
     if name == "http_get":
         from tools.web_search import http_get
@@ -1533,7 +1399,6 @@ async def _dispatch(name: str, args: dict) -> Any:
         return await asyncio.to_thread(github_create_issue, args["owner"], args["repo"], args["title"], args.get("body", ""))
 
     return {"error": f"Unknown tool: {name}"}
-
 
 # ==========================================================================
 # CALL TOOL HANDLER
@@ -1569,7 +1434,6 @@ async def call_tool(name: str, arguments: dict | None = None) -> list[types.Text
             "tool": name,
             "consecutive_failures": _consecutive_failures,
         }))]
-
 
 # ==========================================================================
 # ENTRY POINT
