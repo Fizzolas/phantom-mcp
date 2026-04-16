@@ -57,6 +57,58 @@ more-working state than before.
 That keeps this PR purely additive: it ships scaffolding without
 changing runtime behavior.
 
+## What PR 3 ships (this PR)
+
+- `phantom/tools/shell.py` — `shell_exec(language, command, timeout_s)`
+  collapses run_cmd/run_powershell/run_python behind a single `language`
+  enum. One tool instead of three.
+- `phantom/tools/process_ops.py` — `list_processes`, `find_process`,
+  `kill_process` (now accepts PID *or* name), `launch_app`.
+- `phantom/tools/file_ops.py` — eight file/dir tools with empty-path
+  rejection at the schema layer.
+- `phantom/tools/mouse_kb.py` — 6 tools (mouse_move/click/scroll/drag,
+  keyboard_type/key) down from the legacy 11. `keyboard_key` auto-routes
+  between single-press and hotkey depending on whether the key contains
+  `+`.
+- `phantom/tools/window_ops.py` — 7 tools; `window_state(state=
+  minimize|maximize|restore)` collapses three legacy tools into one.
+- `phantom/tools/vision.py` — `screenshot(region, hires)` collapses
+  two legacy variants; `screen_info`.
+- `phantom/tools/web.py` — `search(kind=web|news|scholar|images|
+  shopping|books)`, `visit_page`, and typed helpers for trends/maps/
+  finance/weather/translate. The per-kind search functions are collapsed
+  into one tool with an enum.
+- `scripts/gen_docs.py` — regenerates `docs/generated/tool-catalog.md`
+  (Markdown table grouped by category) and
+  `docs/generated/tool-system-prompt.md` (model-facing catalog) from
+  `registry.all()`. The registry is now the sole source of truth; docs
+  and code can no longer drift. The hand-written root `README.md` and
+  `SYSTEM_PROMPT.md` still describe the legacy dispatcher and will be
+  retired in PR 4.
+- `tests/test_new_tools.py` — 48 new tests: registration coverage for
+  every PR 3 tool, schema validation on each, a ghost-tool guard, and
+  a sanity check that every registered tool has a docstring and JSON
+  schema.
+- `server.py` — non-functional cleanup: 40 ghost dispatch branches
+  referencing modules that never existed (`browser_ops`, `db_ops`,
+  `document_ops`, `input_ops`, `media_ops`, `system_ops`, `vision_ops`)
+  were removed. No behavior change — every deleted branch would have
+  raised `ModuleNotFoundError` at call time.
+
+**Deliberate non-goals for PR 3** (per the Phil Schmid "curate ruthlessly"
+rule): amazon/ebay/craigslist/youtube/twitter/reddit/linkedin searches
+are not exposed — legacy impls are broken or stubbed. `send_email`,
+`calendar_events`, `stock_price`, `crypto_price`, `currency_convert`,
+`get_weather`, `translate_text` were ghost names for real functions
+(`google_finance`, `google_weather`, `google_translate`) and only the
+real names are exposed. `download_youtube`, `extract_video_clip`,
+`fetch_emails`, and the persistent-shell variant are side-effectful and
+postponed to a later PR.
+
+Not changed: legacy `tools/*` modules are untouched; `server.py` dispatch
+still runs the old tables for the surviving (non-ghost) tools until PR 4
+wires in the registry-based dispatcher.
+
 ## Key design decisions (locked after PR 0 discussion)
 
 1. **Single process** with per-tool timeouts, per-call try/except.
