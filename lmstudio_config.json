@@ -1,20 +1,30 @@
 {
-  "_comment": "Phantom MCP — recommended LM Studio settings. Context must be >= 32768 for screenshots to work reliably.",
-  "model": "lmstudio-community/gemma-4-E4B-it-GGUF",
-  "context_length": 32768,
-  "gpu_offload": "max",
-  "flash_attention": true,
-  "mcp_server": {
-    "name": "phantom",
-    "transport": "stdio",
-    "command": "python",
-    "args": ["server.py"],
-    "cwd": "."
+  "_comment_1": "Phantom MCP — example mcp.json entry for LM Studio. Paste the 'mcpServers' object into LM Studio → Settings → MCP Servers (Manual / stdio).",
+  "_comment_2": "DO NOT put model/context settings here. Set those inside LM Studio's model panel — mcp.json launches MCP servers, nothing else.",
+
+  "mcpServers": {
+    "phantom": {
+      "command": "python",
+      "args": ["server_v2.py"],
+      "cwd": "C:\\phantom-mcp",
+      "env": {}
+    }
   },
-  "notes": [
-    "Set context_length to 32768 minimum in LM Studio model settings.",
-    "Screenshots are now JPEG-compressed at 1280px max — safe at 32k context.",
-    "Shell and file outputs are capped to prevent overflow.",
-    "If you still hit context limits, reduce MAX_WIDTH in tools/pc_vision.py to 960."
+
+  "_recommended_lmstudio_settings": {
+    "context_length_min": 16384,
+    "context_length_recommended": 32768,
+    "tool_use": "enabled",
+    "rationale": [
+      "Phantom truncates large outputs automatically based on the model's context length, so 16k will work — 32k just gives the model more room to keep multiple tool results in mind at once.",
+      "Screenshots default to ~2.5k tokens (downscaled JPEG). desktop_screenshot(hires=true) is much heavier — only use when you need to read fine text.",
+      "If you have a small-context model (4k-8k), keep working — phantom will trim outputs more aggressively. Run memory_compact periodically and avoid hires screenshots."
+    ]
+  },
+
+  "_run_alongside_other_mcp_servers": [
+    "Phantom is self-contained — no other MCP server is required.",
+    "If you do run a second MCP server alongside it, that's fine: LM Studio talks to each over its own stdio pipe and the two memory stores stay independent.",
+    "Tool names in this server are namespaced (desktop_*, memory_*, file_*, window_*, process_*, shell_*, agent_*) so the model can route cleanly even with multiple servers loaded."
   ]
 }

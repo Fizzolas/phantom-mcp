@@ -14,17 +14,17 @@ IF EXIST .python_cmd.txt (
 )
 
 echo Python command: %PYCMD%
-echo Starting server.py...
-echo Logs are written to: logs\server.log
+echo Starting server_v2.py (new registry-based server)...
+echo Logs are written to: logs\server_v2.log
 echo.
 echo [RUNNING] Press Ctrl+C to stop Phantom MCP
 echo.
 
-%PYCMD% server.py
+%PYCMD% server_v2.py
 
 IF ERRORLEVEL 1 (
     echo.
     echo [ERROR] Server exited with an error.
-    echo Check logs\server.log for details.
+    echo Check logs\server_v2.log for details.
     pause
 )
