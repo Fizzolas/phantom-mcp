@@ -55,7 +55,7 @@ _stderr.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"
 log.addHandler(_file)
 log.addHandler(_stderr)
 log.propagate = False
-print("phantom-mcp v2 starting...", flush=True)
+print("phantom-mcp v2 starting...", file=sys.stderr, flush=True)
 
 # ---- phantom internals -----------------------------------------------------
 from phantom.contracts import ToolResult, fail
@@ -161,7 +161,7 @@ async def call_tool(name: str, arguments: dict | None = None) -> list[types.Text
 # ---- entry point -----------------------------------------------------------
 async def _main() -> None:
     await _refresh_runtime_state()
-    print(f"phantom-mcp v2 ready: {len(registry.available())} tools advertised.", flush=True)
+    print(f"phantom-mcp v2 ready: {len(registry.available())} tools advertised.", file=sys.stderr, flush=True)
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
 

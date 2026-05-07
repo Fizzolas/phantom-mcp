@@ -140,7 +140,17 @@ class LearnIn(BaseModel):
 
 
 class CompactIn(BaseModel):
-    target_chars: int = Field(20_000, ge=1024, le=1_000_000)
+    target_chars: int = Field(
+        20_000,
+        ge=1024,
+        le=1_000_000,
+        description=(
+            "Advisory size hint. Actual cutoff is governed by the store's "
+            "trace_keep_after_compact config — older traces are summarised "
+            "into a fact, the most recent N records are kept. Accepted for "
+            "API compatibility but not used to slice by character count."
+        ),
+    )
     model_config = ConfigDict(extra="forbid")
 
 
@@ -317,8 +327,12 @@ def memory_note_delete(label: str) -> dict:
 @tool("memory_compact", category="memory", schema=CompactIn, timeout_s=10.0)
 def memory_compact(target_chars: int = 20_000) -> dict:
     """
-    Trim the action trace log to a manageable size, replacing older
-    records with an aggregate summary stored as a fact. Run when traces
-    grow large or the LM Studio context starts feeling tight.
+    Trim the action trace log: replace older records with an aggregate
+    summary stored as a fact, keep the most recent
+    `trace_keep_after_compact` (config) traces in place.
+
+    Note: `target_chars` is advisory and accepted for API compatibility —
+    the actual cutoff is record-count based, not byte-based. Run this when
+    traces grow large or the LM Studio context starts feeling tight.
     """
     return ok(get_memory().compact(target_chars=target_chars))

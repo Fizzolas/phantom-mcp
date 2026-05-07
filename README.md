@@ -160,7 +160,7 @@ phantom-mcp/
 │   └── tools/                ← every @tool lives here; one module per category
 ├── memory/                   ← legacy memory manager (used by server.py only)
 ├── tools/                    ← legacy tool implementations; phantom/tools wrap these
-├── tests/                    ← pytest tests (37 tests, all passing as of v2)
+├── tests/                    ← pytest tests (82 tests, all passing as of v2)
 ├── data/                     ← created at runtime; memory state lives here
 └── logs/                     ← server_v2.log lives here
 ```
