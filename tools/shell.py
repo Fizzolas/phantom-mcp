@@ -146,12 +146,26 @@ def _run_python_sync(code: str) -> dict:
 # Persistent CMD session
 # =========================================================
 _PERSIST_PROC = None
-_PERSIST_LOCK = asyncio.Lock()
+# FIX (Task 2): Do NOT create asyncio.Lock() at module-import time.
+# Doing so attaches the lock to whichever event loop exists at import time
+# (often the wrong one or none), causing:
+#   RuntimeError: Task got Future attached to a different loop
+# Instead, initialize lazily on first use inside a running coroutine.
+_PERSIST_LOCK: asyncio.Lock | None = None
+
+
+def _get_persist_lock() -> asyncio.Lock:
+    """Return (and lazily create) the persistent CMD lock.
+    Must only be called from inside a running async context."""
+    global _PERSIST_LOCK
+    if _PERSIST_LOCK is None:
+        _PERSIST_LOCK = asyncio.Lock()
+    return _PERSIST_LOCK
 
 
 async def run_persistent_cmd(command: str, timeout: int = 30) -> dict:
     global _PERSIST_PROC
-    async with _PERSIST_LOCK:
+    async with _get_persist_lock():
         if _PERSIST_PROC is None or _PERSIST_PROC.returncode is not None:
             _PERSIST_PROC = await asyncio.create_subprocess_shell(
                 "cmd",
@@ -184,7 +198,7 @@ async def run_persistent_cmd(command: str, timeout: int = 30) -> dict:
 
 async def reset_persistent_cmd() -> dict:
     global _PERSIST_PROC
-    async with _PERSIST_LOCK:
+    async with _get_persist_lock():
         if _PERSIST_PROC and _PERSIST_PROC.returncode is None:
             try:
                 _PERSIST_PROC.kill()
