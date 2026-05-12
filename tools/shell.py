@@ -163,10 +163,39 @@ def _get_persist_lock() -> asyncio.Lock:
     return _PERSIST_LOCK
 
 
+def _is_proc_alive(proc) -> bool:
+    """
+    FIX (Task 3): Liveness check for the persistent CMD subprocess.
+    returncode is not None means the process has already exited cleanly.
+    But a zombie/crashed process can still have returncode == None.
+    We probe stdin with a zero-byte write — if the pipe is broken, it
+    raises BrokenPipeError (POSIX) or OSError (Windows), meaning the
+    process is dead and the handle is stale.
+    """
+    if proc is None:
+        return False
+    if proc.returncode is not None:
+        return False
+    try:
+        proc.stdin.write(b"")  # zero-byte probe; raises if pipe is dead
+        return True
+    except (BrokenPipeError, OSError, AttributeError):
+        return False
+
+
 async def run_persistent_cmd(command: str, timeout: int = 30) -> dict:
     global _PERSIST_PROC
     async with _get_persist_lock():
-        if _PERSIST_PROC is None or _PERSIST_PROC.returncode is not None:
+        # FIX (Task 3): Replace simple returncode check with full liveness probe.
+        # _is_proc_alive() catches zombie processes whose returncode is still None
+        # but whose stdin pipe is already broken (stale handle).
+        if not _is_proc_alive(_PERSIST_PROC):
+            # Clean up any lingering stale handle before spawning fresh
+            if _PERSIST_PROC is not None:
+                try:
+                    _PERSIST_PROC.kill()
+                except Exception:
+                    pass
             _PERSIST_PROC = await asyncio.create_subprocess_shell(
                 "cmd",
                 stdin=asyncio.subprocess.PIPE,
@@ -190,7 +219,16 @@ async def run_persistent_cmd(command: str, timeout: int = 30) -> dict:
                     break
                 output_lines.append(line)
         except asyncio.TimeoutError:
-            return {"error": f"Persistent CMD timed out after {timeout}s", "returncode": -1}
+            # FIX (Task 3): Include the hung command in the timeout message so
+            # the agent knows exactly what blocked, not just that a timeout occurred.
+            return {
+                "error": (
+                    f"Persistent CMD timed out after {timeout}s — "
+                    f"hung command: {command!r}. "
+                    "Call reset_persistent_cmd() to clear the session."
+                ),
+                "returncode": -1,
+            }
 
         output = _truncate("".join(output_lines))
         return {"stdout": output, "stderr": "", "returncode": 0}
