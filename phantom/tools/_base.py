@@ -28,10 +28,11 @@ original review:
 """
 from __future__ import annotations
 
+import copy
 import importlib
 import inspect
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 try:
@@ -44,6 +45,49 @@ from phantom.contracts import ToolResult, fail
 from phantom.runtime.executor import safe_call
 
 log = logging.getLogger("phantom.registry")
+
+
+def _inline_local_schema_refs(schema: dict[str, Any]) -> dict[str, Any]:
+    """
+    Flatten Pydantic-generated $defs / definitions into a self-contained
+    JSON Schema document.
+
+    LM Studio's tool parser does not follow local $ref chains, so any
+    nested Pydantic model that emits a $defs block would be silently
+    misread. This function recursively replaces every '#/$defs/<key>' or
+    '#/definitions/<key>' reference with the inlined definition body,
+    then removes the now-redundant $defs / definitions section.
+    """
+    defs = schema.pop("$defs", None) or schema.pop("definitions", None) or {}
+    if not defs:
+        return schema
+
+    def _resolve(node: Any) -> Any:
+        if isinstance(node, list):
+            return [_resolve(item) for item in node]
+
+        if not isinstance(node, dict):
+            return node
+
+        ref = node.get("$ref")
+        if isinstance(ref, str):
+            for prefix in ("#/$defs/", "#/definitions/"):
+                if ref.startswith(prefix):
+                    key = ref[len(prefix):]
+                    target = defs.get(key)
+                    if target is None:
+                        # Unknown ref — leave other keys, drop the $ref.
+                        return {k: _resolve(v) for k, v in node.items()}
+                    resolved = _resolve(copy.deepcopy(target))
+                    # Merge any sibling keywords (e.g. "title") onto the resolved body.
+                    siblings = {k: _resolve(v) for k, v in node.items() if k != "$ref"}
+                    if isinstance(resolved, dict):
+                        return {**resolved, **siblings}
+                    return resolved
+
+        return {k: _resolve(v) for k, v in node.items()}
+
+    return _resolve(schema)
 
 
 @dataclass
@@ -61,10 +105,14 @@ class ToolSpec:
         """JSON Schema the MCP layer advertises for this tool."""
         if self.schema is None or BaseModel is None:
             return {"type": "object", "properties": {}, "additionalProperties": True}
-        # pydantic v2 exposes .model_json_schema(); v1 exposes .schema()
+
+        # Pass 2 Issue 2: Pydantic v2 can emit $defs with $ref indirections.
+        # LM Studio expects a self-contained schema, so inline all local refs.
         if hasattr(self.schema, "model_json_schema"):
-            return self.schema.model_json_schema()
-        return self.schema.schema()  # type: ignore[attr-defined]
+            schema = self.schema.model_json_schema()
+        else:
+            schema = self.schema.schema()  # type: ignore[attr-defined]
+        return _inline_local_schema_refs(schema)
 
 
 class ToolRegistry:
@@ -198,8 +246,8 @@ def _safe_import_tool_module(mod_path: str) -> bool:
     try:
         importlib.import_module(mod_path)
         return True
-    # Issue 3 fix: only silently skip on import failures (missing optional dep).
-    # Any other exception is a real bug in the tool module — surface it fully.
+    # Pass 1 Issue 3: narrow the catch to import failures only. Anything else
+    # is a real bug inside the tool module — log with full traceback.
     except (ImportError, ModuleNotFoundError) as e:
         log.warning("skipping tool module %s (missing dep): %s", mod_path, e)
         return False

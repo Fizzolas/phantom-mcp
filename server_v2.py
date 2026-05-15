@@ -56,7 +56,8 @@ log.addHandler(_file)
 log.addHandler(_stderr)
 log.propagate = False
 
-# Issue 2 fix: log after handlers are attached, not before.
+# Pass 1 Issue 2: log.info() fires after both handlers are attached,
+# never before — no raw print() that could accidentally corrupt stdio.
 log.info("phantom-mcp v2 starting...")
 
 # ---- phantom internals -----------------------------------------------------
@@ -86,7 +87,8 @@ async def _refresh_runtime_state() -> None:
     caps = probe_capabilities()
     registry.set_capabilities(caps)
 
-    # Issue 1 fix: use `lms_probe` so we don't shadow the imported `probe_lmstudio`.
+    # Pass 1 Issue 1: renamed `probe` -> `lms_probe` to avoid shadowing the
+    # imported `probe_lmstudio` function name.
     lms_probe = await probe_lmstudio()
     _LMS_INFO = lms_probe.as_dict()
     _BUDGET = TokenBudget(context_length=lms_probe.context_length)
@@ -99,8 +101,10 @@ async def _refresh_runtime_state() -> None:
 # ---- MCP server ------------------------------------------------------------
 app = Server("phantom-mcp")
 
-# Issue 4 fix: use a logging Filter as a thread-safe once-flag instead of a
-# mutable global bool. The filter fires exactly once, then deactivates itself.
+
+# Pass 1 Issue 4: replaced the mutable global `_tools_list_logged` bool with a
+# thread-safe logging.Filter once-flag so concurrent list_tools() calls can't
+# race and emit duplicate log lines.
 class _OnceFilter(logging.Filter):
     def __init__(self) -> None:
         super().__init__()
@@ -112,6 +116,7 @@ class _OnceFilter(logging.Filter):
         self._fired = True
         return True
 
+
 _list_tools_once = _OnceFilter()
 
 
@@ -121,6 +126,10 @@ def _spec_to_mcp_tool(spec) -> types.Tool:
     # MCP wants 'properties' present even on no-arg tools.
     schema.setdefault("type", "object")
     schema.setdefault("properties", {})
+    # Pass 2 Issue 4: when a tool declares a pydantic schema, reject unknown
+    # keys at the MCP layer rather than letting them fall through silently.
+    if spec.schema is not None:
+        schema.setdefault("additionalProperties", False)
     return types.Tool(
         name=spec.name,
         description=spec.description or "(no description provided)",
@@ -173,6 +182,17 @@ async def call_tool(name: str, arguments: dict | None = None) -> list[types.Text
         except Exception:
             log.exception("budget.fit_any failed for %s", name)
 
+    # Pass 2 Issue 3: simple ok=True string results are returned as plain text
+    # so LM Studio doesn't need to parse a JSON envelope for trivial responses.
+    if (
+        payload.get("ok") is True
+        and isinstance(payload.get("data"), str)
+        and not payload.get("meta")
+        and not payload.get("error")
+        and not payload.get("hint")
+    ):
+        return [types.TextContent(type="text", text=payload["data"])]
+
     text = json.dumps(payload, ensure_ascii=False, default=str)
     return [types.TextContent(type="text", text=text)]
 
@@ -180,6 +200,8 @@ async def call_tool(name: str, arguments: dict | None = None) -> list[types.Text
 # ---- entry point -----------------------------------------------------------
 async def _main() -> None:
     await _refresh_runtime_state()
+    # Pass 2 Issue 1: log.info() instead of print() — no stdout writes near
+    # the MCP transport loop.
     log.info("phantom-mcp v2 ready: %d tools advertised.", len(registry.available()))
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
