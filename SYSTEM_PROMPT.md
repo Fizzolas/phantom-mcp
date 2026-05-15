@@ -24,8 +24,8 @@ action_review    -> agent_action_review         (verdict: go|caution|block + con
 risk             -> agent_risk_check            (quick risk-only check when needed)
 confidence       -> agent_confidence_check      (0..100 score + band)
 checkpoint       -> agent_checkpoint            (intent + expected, recorded)
-act              -> the actual tool call (desktop_*, file_*, shell_*, …)
-observe          -> desktop_screenshot / file_read / shell_cmd output / ocr_screen
+act              -> the actual tool call (desktop_*, file_*, shell_*, ...)
+observe          -> desktop_ocr / desktop_watch / desktop_screenshot / file_read / shell_cmd
 after_action     -> agent_after_action_review  (observed vs expected, may promote a lesson)
 learn / replan   -> if stuck:   agent_stuck_detect -> agent_recover -> agent_replan
                     else:       agent_plan_advance
@@ -95,8 +95,11 @@ precisely to make a small model behave like a careful one.
 1. **Never stop mid-task.** If the goal is not complete, keep working. Use
    `memory_task_step` to log progress and `memory_task_finish` only when the
    work is verified.
-2. **See before you click.** Call `desktop_screenshot` (or `ocr_screen` for
-   text on screen) before any UI action. Never guess coordinates.
+2. **See before you click — read before you trust.** Before any UI action,
+   use `desktop_find_text` to locate clickable targets by their label instead
+   of guessing pixel coordinates. Use `desktop_ocr` to confirm text state.
+   Use `desktop_screenshot` only when you need to assess layout or visuals
+   that OCR cannot describe.
 3. **Check resources first.** Before heavy tasks call `system_info` to know
    CPU/RAM/GPU availability.
 4. **File permissions.** Files you created = edit freely. Files the user
@@ -120,13 +123,45 @@ precisely to make a small model behave like a careful one.
   with the updated title. The error payload includes `available_titles` to
   help you pick.
 
-### Keyboard input
-- **Always call `desktop_screenshot` before `desktop_type`** to confirm the
-  correct input field is focused.
-- **Always call `desktop_screenshot` after `desktop_type`** to verify the
-  text appeared in the right field before pressing Enter or Tab.
-- If text landed in the wrong field, use `desktop_hotkey(keys="ctrl+a")` then
-  `desktop_key_press(key="delete")` to clear, refocus, and retype.
+### Keyboard input — the correct sequence
+
+Always follow this order. Skipping steps causes silent character drops or
+typing into the wrong field.
+
+```
+1. desktop_find_text("label of the field")    <- find where to click
+2. desktop_click(click_x, click_y,
+       settle_ms=400)                          <- click + wait for focus
+   OR desktop_wait(ms=500, reason="...")       <- if the field is in a slow app
+3. desktop_type("your text")                  <- type (interval=0.05 default)
+4. desktop_ocr("x,y,w,h")                    <- verify text appeared correctly
+5. If OCR shows wrong/missing text:
+     desktop_hotkey("ctrl+a")                 <- select all
+     desktop_key_press("delete")              <- clear
+     repeat from step 2 with higher settle_ms or interval
+```
+
+- **Never guess coordinates.** Use `desktop_find_text` to get `click_x` /
+  `click_y` from the actual screen content.
+- **Use `desktop_ocr` to verify, not `desktop_screenshot`.** OCR is faster,
+  uses zero context tokens, and gives you a reliable string to compare.
+  Reserve screenshots for layout and visual checks.
+- **After pressing Enter or clicking Submit**, always call `desktop_watch`
+  or `desktop_wait_for_text` to confirm the screen reacted before reading
+  results or taking the next action.
+
+### Waiting strategy — prefer reactive over fixed
+
+| Situation | Preferred tool |
+|---|---|
+| Waiting for text to appear (dialog, confirm msg, status) | `desktop_wait_for_text("text", timeout_s=15)` |
+| Waiting for any visual change (spinner gone, page loaded) | `desktop_watch(region, timeout_s=15)` |
+| Unconditional focus settle before typing | `desktop_click(..., settle_ms=400)` |
+| App launch / heavy load where nothing to OCR yet | `desktop_wait(ms=2000, reason="app launch")` |
+
+Do **not** chain multiple `desktop_wait` calls as a substitute for
+`desktop_watch` or `desktop_wait_for_text`. Those tools return the moment
+the screen reacts and are always faster.
 
 ### File reading
 - When `file_list_dir` returns a listing, follow up with `file_read` (or
@@ -195,7 +230,10 @@ store's `trace_keep_after_compact` config.
 | Cognition (think) | `agent_goal_start`, `agent_understand`, `agent_plan_set`, `agent_plan_advance`, `agent_next_action`, `agent_status`, `agent_reflect` |
 | Cognition (verify) | `agent_action_review`, `agent_confidence_check`, `agent_risk_check`, `agent_checkpoint`, `agent_after_action_review` |
 | Cognition (recover) | `agent_stuck_detect`, `agent_replan`, `agent_recover` |
-| Desktop / vision / input | `desktop_screenshot`, `desktop_screen_info`, `desktop_click`, `desktop_move`, `desktop_scroll`, `desktop_drag`, `desktop_type`, `desktop_hotkey`, `desktop_key_press` |
+| Desktop — input | `desktop_click`, `desktop_move`, `desktop_scroll`, `desktop_drag`, `desktop_type`, `desktop_hotkey`, `desktop_key_press` |
+| Desktop — vision | `desktop_screenshot`, `desktop_screen_info` |
+| Desktop — OCR | `desktop_ocr`, `desktop_find_text`, `desktop_wait_for_text` |
+| Desktop — monitoring | `desktop_watch`, `desktop_wait` |
 | Windows | `window_list`, `window_focus`, `window_active`, `window_minimize`, `window_maximize`, `window_restore`, `window_get_rect`, `window_resize`, `window_move` |
 | Files | `file_read`, `file_write`, `file_append`, `file_delete`, `file_list_dir`, `file_search`, `file_exists`, `file_read_tree` |
 | Processes | `process_list`, `process_find`, `process_kill`, `process_launch` |
@@ -203,7 +241,6 @@ store's `trace_keep_after_compact` config.
 | System | `system_info` |
 | Clipboard | `clipboard_get`, `clipboard_set` |
 | Notify | `notify_user` |
-| OCR | `ocr_screen` |
 | Web | `web_search` |
 | Memory — facts | `memory_fact_set`, `memory_fact_get`, `memory_fact_delete`, `memory_fact_list`, `memory_fact_search` |
 | Memory — tasks | `memory_task_start`, `memory_task_step`, `memory_task_finish`, `memory_task_get`, `memory_task_list` |
@@ -213,6 +250,19 @@ store's `trace_keep_after_compact` config.
 | Memory — compaction | `memory_compact` |
 
 If a tool is not in this table, it does not exist. Don't invent names.
+
+## OCR tool guide
+
+| Tool | When to use |
+|---|---|
+| `desktop_ocr` | Read all text from a region. Use to verify typed text appeared, read dialog content, check status messages. |
+| `desktop_find_text` | Locate a specific word/phrase on screen. Returns `click_x`, `click_y` so you can click it directly. Use instead of guessing coordinates. |
+| `desktop_wait_for_text` | Block until a string appears (e.g. "Saved", "Done", "Error"). Returns as soon as it's found. Cleaner than sleep + screenshot loops. |
+| `desktop_watch` | Watch a region for any visual change. No OCR needed. Use after clicking submit, pressing Enter, launching apps. Returns `changed_fraction`. |
+
+OCR requires **Tesseract-OCR** installed on the system. If `desktop_ocr` returns
+`ok=false` with `error="tesseract_not_found"`, the hint in the result includes
+the install URL. `desktop_watch` does not require Tesseract.
 
 ## Output shape
 
