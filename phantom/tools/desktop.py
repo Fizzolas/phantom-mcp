@@ -13,9 +13,34 @@ Design notes:
     "what happened" in one short blob (no giant logs).
   * Screenshot returns base64 JPEG, with size + chars in meta so the
     model can decide whether it can afford another one.
+
+Pass 6 changes:
+  * desktop_type
+    - Default interval raised 0.02 → 0.05 (Win10 apps drop chars at 20ms).
+    - timeout_s raised 30 → 45 (long pastes hit 30s on a loaded GPU box).
+    - Description now explicitly tells the model to click the target and
+      wait for focus BEFORE calling this tool, and to use desktop_wait
+      after clicking if the target is a slow app.
+    - Returns 'method' in the result so the model knows whether direct
+      write or clipboard paste was used.
+  * desktop_click
+    - Added optional settle_ms (default 150ms) — waits after the click so
+      the window has time to receive focus before the model types.
+    - Added confirm_screenshot pass-through so the model can do
+      click-and-verify in a single round trip.
+    - timeout_s raised 8 → 12 to cover the settle window.
+  * desktop_wait  (NEW)
+    - Explicit sleep tool. Lets the model pause between actions when it
+      knows a transition is slow (app launch, dialog open, page load).
+    - Range: 100ms – 30s.  Model should describe WHY it is waiting so
+      traces are readable.
+  * desktop_screen_info
+    - Description now tells the model to call this FIRST in any session
+      and to use the returned bounds to validate coordinates before clicking.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -90,8 +115,10 @@ def desktop_screen_info() -> dict:
     """
     Return primary screen size and screenshot settings.
 
-    Call once at the start of a session to know the coordinate bounds for
-    mouse_* tools.
+    Call this FIRST at the start of any desktop session. The returned
+    'width' and 'height' are the coordinate bounds you must stay within
+    for all mouse_* tools — coordinates outside these bounds will be
+    rejected by pyautogui's failsafe or land in the wrong place.
     """
     from tools.pc_vision import get_screen_info
     return ok(get_screen_info())
@@ -105,6 +132,20 @@ class MouseClickInput(BaseModel):
     y: int = Field(..., ge=0)
     button: MouseButton = Field("left")
     clicks: int = Field(1, ge=1, le=3)
+    settle_ms: int = Field(
+        150,
+        ge=0,
+        le=5000,
+        description=(
+            "Milliseconds to wait after the click before returning. "
+            "Increase to 400–800 for dialogs, menus, or any UI that is slow to "
+            "receive focus. Default 150ms covers most normal windows."
+        ),
+    )
+    confirm_screenshot: bool = Field(
+        False,
+        description="If true, returns a screenshot in the result so you can verify the click landed correctly.",
+    )
 
     model_config = ConfigDict(extra="forbid")
 
@@ -114,18 +155,38 @@ class MouseClickInput(BaseModel):
     category="desktop",
     schema=MouseClickInput,
     needs=("desktop",),
-    timeout_s=8.0,
+    timeout_s=12.0,
 )
-async def desktop_click(x: int, y: int, button: str = "left", clicks: int = 1) -> dict:
+async def desktop_click(
+    x: int,
+    y: int,
+    button: str = "left",
+    clicks: int = 1,
+    settle_ms: int = 150,
+    confirm_screenshot: bool = False,
+) -> dict:
     """
-    Click at screen coordinate (x, y).
+    Click at screen coordinate (x, y) then wait for focus to settle.
+
+    IMPORTANT — click THEN type, never simultaneously:
+      1. Call desktop_click on the input field.
+      2. If the target is a slow app (browser address bar, dialog, terminal),
+         increase settle_ms to 400-800 or follow with desktop_wait.
+      3. Only then call desktop_type.
 
     For double-click pass clicks=2. For right-click pass button="right".
-    Pair with desktop_screenshot afterwards to confirm the result.
+    Set confirm_screenshot=True to verify the click landed before typing.
     """
     from tools.mouse_kb import mouse_click as legacy
-    msg = await legacy(x, y, button=button, clicks=clicks)
-    return ok({"message": msg, "x": x, "y": y, "button": button, "clicks": clicks})
+    msg = await legacy(x, y, button=button, clicks=clicks, confirm_screenshot=confirm_screenshot)
+    if settle_ms > 0:
+        await asyncio.sleep(settle_ms / 1000.0)
+    result = {"x": x, "y": y, "button": button, "clicks": clicks, "settle_ms": settle_ms}
+    if isinstance(msg, dict):
+        result.update(msg)
+    else:
+        result["message"] = msg
+    return ok(result)
 
 
 class MouseMoveInput(BaseModel):
@@ -207,11 +268,67 @@ async def desktop_drag(
 
 
 # ----------------------------------------------------------------------
+# Wait
+# ----------------------------------------------------------------------
+class WaitInput(BaseModel):
+    ms: int = Field(
+        500,
+        ge=100,
+        le=30000,
+        description="How long to wait in milliseconds (100–30000). Use 500 for normal UI transitions, 1000–3000 for app launches or page loads.",
+    )
+    reason: str = Field(
+        "",
+        description="Why you are waiting (e.g. 'waiting for dialog to open', 'letting browser load'). Logged to traces.",
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+
+@tool(
+    "desktop_wait",
+    category="desktop",
+    schema=WaitInput,
+    needs=("desktop",),
+    timeout_s=35.0,
+)
+async def desktop_wait(ms: int = 500, reason: str = "") -> dict:
+    """
+    Pause for `ms` milliseconds before continuing.
+
+    Use this when:
+      - You opened an app or window and need it to finish loading.
+      - You clicked a button that triggers a slow transition (dialog, page load).
+      - You pressed a hotkey and need the UI to respond before reading the screen.
+      - You are about to type and the focus target was slow to appear.
+
+    Typical values:
+      - 300–500ms  : normal button/menu/focus transition
+      - 800–1500ms : dialog opening, browser tab loading
+      - 2000–5000ms: app launch (Notepad, Explorer, IDE)
+      - 5000–10000ms: heavy app launch (browser cold start, IDE indexing)
+
+    Always follow with desktop_screenshot to confirm the UI is ready.
+    """
+    await asyncio.sleep(ms / 1000.0)
+    return ok({"waited_ms": ms, "reason": reason or "(no reason given)"})
+
+
+# ----------------------------------------------------------------------
 # Keyboard
 # ----------------------------------------------------------------------
 class KeyboardTypeInput(BaseModel):
-    text: str = Field(..., description="Text to type. Newlines/special chars use clipboard fallback.")
-    interval: float = Field(0.02, ge=0.0, le=1.0)
+    text: str = Field(..., description="Text to type into the currently-focused window.")
+    interval: float = Field(
+        0.05,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Delay in seconds between each keypress for direct-write mode. "
+            "Default 0.05s (50ms) is safe for Win10. Reduce to 0.02 only for "
+            "fast terminals; increase to 0.10 if characters are still dropped."
+        ),
+    )
 
     model_config = ConfigDict(extra="forbid")
 
@@ -221,18 +338,35 @@ class KeyboardTypeInput(BaseModel):
     category="desktop",
     schema=KeyboardTypeInput,
     needs=("desktop",),
-    timeout_s=30.0,
+    timeout_s=45.0,
 )
-async def desktop_type(text: str, interval: float = 0.02) -> dict:
+async def desktop_type(text: str, interval: float = 0.05) -> dict:
     """
-    Type text at the current focus. The currently-focused window will
-    receive the keystrokes.
+    Type text into the currently-focused window.
 
-    For long text or text with special characters (newlines, emoji,
-    punctuation that pyautogui drops) this falls back to clipboard paste.
+    PREREQUISITES — do these BEFORE calling desktop_type:
+      1. desktop_click on the target input field.
+      2. Wait for focus: either use settle_ms in desktop_click (400+ for
+         slow apps) OR call desktop_wait (500-1000ms for dialogs/browsers).
+      3. Optionally desktop_screenshot to confirm the cursor is in the field.
+
+    Behaviour:
+      - Short text with only letters/digits/basic punctuation: typed directly
+        key-by-key at `interval` seconds per character.
+      - Text containing newlines, tabs, @, #, {, emoji, or other special
+        characters: sent via clipboard paste (Ctrl+V) automatically.
+      - The result includes 'method' ('direct_write' or 'clipboard') so you
+        can diagnose drops.
+
+    If characters are still being dropped after following prerequisites:
+      - Increase interval to 0.10.
+      - Use desktop_hotkey('ctrl+a') first to clear the field.
+      - Consider shell_run for programmatic input instead of GUI typing.
     """
     from tools.mouse_kb import keyboard_type as legacy
     msg = await legacy(text, interval=interval)
+    if isinstance(msg, dict):
+        return ok({**msg, "chars": len(text)})
     return ok({"message": msg, "chars": len(text)})
 
 

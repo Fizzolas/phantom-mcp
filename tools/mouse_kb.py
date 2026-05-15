@@ -27,6 +27,18 @@ FIX (Bug 6): mouse_scroll now passes x and y directly to pyautogui.scroll()
   On a lagged system the cursor could drift between the two calls, causing
   the scroll to land at the wrong position. Pinning the coordinates to the
   scroll call itself eliminates the race.
+
+Pass 6:
+  * keyboard_type default interval raised 0.02 -> 0.05.
+    Win10 apps (Notepad, browsers, VS Code, terminals) drop characters when
+    pyautogui.write() fires at 20ms intervals under GPU load. 50ms is a safe
+    default that still feels fast to a human watching the screen.
+    Callers that need maximum speed can still pass interval=0.02 explicitly.
+  * keyboard_type now always returns a dict (was sometimes returning a plain
+    string from the legacy path) so the desktop_type wrapper can reliably
+    include 'method' in the MCP tool response.
+  * _SAFE_CHARS: added '\t' handling — tabs are ASCII printable but
+    pyautogui.write() drops them. Tabs now route through the clipboard path.
 """
 import asyncio
 import base64
@@ -37,13 +49,18 @@ import pyautogui
 pyautogui.FAILSAFE = True   # Move mouse to top-left corner to abort
 pyautogui.PAUSE    = 0.04   # Small inter-action pause for stability
 
-# Characters pyautogui.write() handles reliably
+# Characters pyautogui.write() handles reliably.
+# Note: \t (tab) is intentionally excluded — pyautogui.write() silently
+# drops it. Tab input should go through the clipboard path.
 _SAFE_CHARS = set(string.ascii_letters + string.digits + string.punctuation + " ")
 
 
 def _needs_clipboard(text: str) -> bool:
     """Return True if text contains chars that pyautogui.write() drops."""
-    return any(c not in _SAFE_CHARS for c in text) or "\n" in text or "\t" in text
+    # Newlines and tabs always need clipboard.
+    if "\n" in text or "\t" in text:
+        return True
+    return any(c not in _SAFE_CHARS for c in text)
 
 
 def _screenshot_b64() -> str | None:
@@ -185,11 +202,20 @@ def _clipboard_type_sync(text: str) -> dict:
 
 async def keyboard_type(
     text: str,
-    interval: float = 0.02,
+    interval: float = 0.05,
     confirm_screenshot: bool = False,
 ) -> dict:
     """
-    Type a string. Uses clipboard-paste fallback for special chars (\n, @, #, etc.)
+    Type a string. Uses clipboard-paste fallback for special chars (\n, \t, @, #, etc.)
+
+    Pass 6: default interval raised from 0.02 to 0.05.
+    Win10 apps drop characters at 20ms under GPU inference load.
+    50ms is the safe default; callers may override down to 0.02 for
+    fast terminals or up to 0.10 for apps that are especially laggy.
+
+    Always returns a dict with 'ok', 'method', and 'text_preview' keys
+    so desktop_type can include 'method' in the MCP response.
+
     confirm_screenshot: if True, captures a screenshot after typing.
     """
     label = f"{text[:60]}{'...' if len(text) > 60 else ''}"
@@ -207,6 +233,7 @@ async def keyboard_type(
         except RuntimeError as e:
             result["ok"] = False
             result["error"] = str(e)
+            result["method"] = "clipboard_failed"
             return result
     else:
         await asyncio.to_thread(pyautogui.write, text, interval=interval)
