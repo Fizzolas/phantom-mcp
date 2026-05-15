@@ -14,29 +14,19 @@ Design notes:
   * Screenshot returns base64 JPEG, with size + chars in meta so the
     model can decide whether it can afford another one.
 
-Pass 6 changes:
-  * desktop_type
-    - Default interval raised 0.02 → 0.05 (Win10 apps drop chars at 20ms).
-    - timeout_s raised 30 → 45 (long pastes hit 30s on a loaded GPU box).
-    - Description now explicitly tells the model to click the target and
-      wait for focus BEFORE calling this tool, and to use desktop_wait
-      after clicking if the target is a slow app.
-    - Returns 'method' in the result so the model knows whether direct
-      write or clipboard paste was used.
-  * desktop_click
-    - Added optional settle_ms (default 150ms) — waits after the click so
-      the window has time to receive focus before the model types.
-    - Added confirm_screenshot pass-through so the model can do
-      click-and-verify in a single round trip.
-    - timeout_s raised 8 → 12 to cover the settle window.
-  * desktop_wait  (NEW)
-    - Explicit sleep tool. Lets the model pause between actions when it
-      knows a transition is slow (app launch, dialog open, page load).
-    - Range: 100ms – 30s.  Model should describe WHY it is waiting so
-      traces are readable.
-  * desktop_screen_info
-    - Description now tells the model to call this FIRST in any session
-      and to use the returned bounds to validate coordinates before clicking.
+Pass 6:
+  * desktop_type: interval default 0.02->0.05, timeout 30->45, better docs
+  * desktop_click: settle_ms param + confirm_screenshot pass-through, timeout 8->12
+  * desktop_wait: new tool — explicit pause between actions
+  * desktop_screen_info: better doc on call-first usage
+
+Pass 7 — OCR + Screen Monitoring:
+  * desktop_ocr: extract all text from a screen region via tesseract.
+  * desktop_find_text: OCR + substring search; returns click coords if found.
+  * desktop_wait_for_text: polls OCR until a string appears or timeout.
+  * desktop_watch: watches a region for any visual change; no OCR required.
+    Use after clicking buttons, typing text, launching apps, or pressing
+    Enter — wait for the screen to actually react before the next action.
 """
 from __future__ import annotations
 
@@ -82,6 +72,11 @@ async def desktop_screenshot(region: str = "full", hires: bool = False) -> dict:
     Use this AFTER any visual change you make so you can verify the
     result before the next action. Default returns a downscaled JPEG
     (~2.5k tokens). Set hires=True only when you need to read fine text.
+
+    PREFER desktop_ocr for reading text from the screen — it is faster,
+    uses zero context tokens, and gives you a reliable string you can search.
+    Only use this tool when you need to see layout, images, or visual state
+    that OCR cannot describe.
     """
     if hires:
         from tools.pc_vision import take_screenshot_hires as legacy
@@ -122,6 +117,226 @@ def desktop_screen_info() -> dict:
     """
     from tools.pc_vision import get_screen_info
     return ok(get_screen_info())
+
+
+# ----------------------------------------------------------------------
+# OCR
+# ----------------------------------------------------------------------
+class OcrInput(BaseModel):
+    region: str = Field(
+        "full",
+        description="Screen region to read: 'full' or 'x,y,w,h' (e.g. '100,200,400,100').",
+    )
+    lang: str = Field(
+        "eng",
+        description="Tesseract language code. 'eng' for English. Use 'eng+fra' for multilingual.",
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+
+@tool(
+    "desktop_ocr",
+    category="desktop",
+    schema=OcrInput,
+    needs=("desktop",),
+    timeout_s=20.0,
+)
+async def desktop_ocr(region: str = "full", lang: str = "eng") -> dict:
+    """
+    Extract all text from a screen region using OCR (tesseract).
+
+    Use this to:
+      - Verify that text you typed actually appeared in the UI.
+      - Read error messages, dialog content, or status text.
+      - Confirm an app loaded the right content after navigation.
+      - Read small text without burning context tokens on a screenshot.
+
+    Returns the full extracted text as a string. Use desktop_find_text
+    if you need to know WHERE a specific word appears so you can click it.
+
+    Requires Tesseract-OCR to be installed on the system.
+    Returns ok=false with a clear error + install hint if it is missing.
+    """
+    from tools.pc_vision import ocr_region
+    return ok(await ocr_region(region=region, lang=lang))
+
+
+class FindTextInput(BaseModel):
+    needle: str = Field(..., description="The text or substring to search for on screen.")
+    region: str = Field(
+        "full",
+        description="Screen region to search: 'full' or 'x,y,w,h'.",
+    )
+    case_sensitive: bool = Field(False, description="If false (default), search is case-insensitive.")
+    lang: str = Field("eng", description="Tesseract language code.")
+
+    model_config = ConfigDict(extra="forbid")
+
+
+@tool(
+    "desktop_find_text",
+    category="desktop",
+    schema=FindTextInput,
+    needs=("desktop",),
+    timeout_s=20.0,
+)
+async def desktop_find_text(
+    needle: str,
+    region: str = "full",
+    case_sensitive: bool = False,
+    lang: str = "eng",
+) -> dict:
+    """
+    Search for text on screen via OCR. Returns found=True/False.
+
+    If found, also returns:
+      - click_x, click_y: center of the word's bounding box in screen
+        coordinates. Pass these directly to desktop_click to click the text.
+      - x, y, width, height: bounding box for visual reference.
+
+    Use this when you need to:
+      - Click a button or link whose position you don't know in advance.
+      - Confirm a specific word or value is visible after an action.
+      - Find the location of an error message to dismiss it.
+
+    Prefer this over taking a screenshot and guessing coordinates.
+    """
+    from tools.pc_vision import find_text_on_screen
+    result = await find_text_on_screen(
+        needle, region=region, case_sensitive=case_sensitive, lang=lang
+    )
+    return ok(result)
+
+
+class WaitForTextInput(BaseModel):
+    needle: str = Field(..., description="Text to wait for.")
+    region: str = Field("full", description="Screen region: 'full' or 'x,y,w,h'.")
+    timeout_s: float = Field(
+        15.0, ge=1.0, le=120.0,
+        description="Max seconds to wait before giving up.",
+    )
+    poll_s: float = Field(
+        1.0, ge=0.2, le=10.0,
+        description="Seconds between OCR checks. Default 1s is a good balance.",
+    )
+    case_sensitive: bool = Field(False)
+    lang: str = Field("eng")
+
+    model_config = ConfigDict(extra="forbid")
+
+
+@tool(
+    "desktop_wait_for_text",
+    category="desktop",
+    schema=WaitForTextInput,
+    needs=("desktop",),
+    timeout_s=125.0,
+)
+async def desktop_wait_for_text(
+    needle: str,
+    region: str = "full",
+    timeout_s: float = 15.0,
+    poll_s: float = 1.0,
+    case_sensitive: bool = False,
+    lang: str = "eng",
+) -> dict:
+    """
+    Wait until specific text appears on screen (via OCR), or timeout.
+
+    Use this when:
+      - You submitted a form or pressed Enter and need to wait for a
+        confirmation message (e.g. 'Saved', 'Done', 'Success').
+      - You launched an app and need to wait for it to finish loading
+        (e.g. wait for 'File' menu to appear).
+      - You are waiting for a long-running process to print a result.
+
+    Returns {found: true, click_x, click_y} when the text appears so you
+    can immediately act on it. Returns {found: false, timed_out: true} if
+    the text never appeared within timeout_s.
+
+    Prefer this over desktop_wait + desktop_screenshot + manual reading.
+    It is more reliable and does not burn context tokens on images.
+    """
+    from tools.pc_vision import wait_for_text
+    result = await wait_for_text(
+        needle,
+        region=region,
+        timeout_s=timeout_s,
+        poll_s=poll_s,
+        case_sensitive=case_sensitive,
+        lang=lang,
+    )
+    return ok(result)
+
+
+class WatchInput(BaseModel):
+    region: str = Field(
+        "full",
+        description="Region to monitor: 'full' or 'x,y,w,h'. Narrow regions are faster and more sensitive.",
+    )
+    change_threshold: float = Field(
+        0.02,
+        ge=0.001,
+        le=1.0,
+        description=(
+            "Fraction of pixels that must change to count as 'changed'. "
+            "0.02 = 2% (default, catches dialogs/spinners). "
+            "0.005 for subtle changes like a single word appearing. "
+            "0.10 for major transitions like a full page reload."
+        ),
+    )
+    timeout_s: float = Field(15.0, ge=1.0, le=120.0, description="Max seconds to wait.")
+    poll_s: float = Field(0.5, ge=0.1, le=5.0, description="Seconds between frames.")
+
+    model_config = ConfigDict(extra="forbid")
+
+
+@tool(
+    "desktop_watch",
+    category="desktop",
+    schema=WatchInput,
+    needs=("desktop",),
+    timeout_s=125.0,
+)
+async def desktop_watch(
+    region: str = "full",
+    change_threshold: float = 0.02,
+    timeout_s: float = 15.0,
+    poll_s: float = 0.5,
+) -> dict:
+    """
+    Watch a screen region and return when it changes visually.
+
+    This is the most lightweight way to confirm an action had an effect.
+    No OCR, no context tokens — just pixel comparison.
+
+    Use this AFTER:
+      - Pressing Enter or clicking a submit button — watch for the
+        response to appear before reading or acting further.
+      - Typing in a search box — watch for results to load.
+      - Launching an app — watch for the window to appear.
+      - Clicking a menu — watch for it to open.
+
+    Returns:
+      {changed: true, changed_fraction: 0.07, waited_s: 1.5}
+      {changed: false, timed_out: true, timeout_s: 15.0}
+
+    Pair with desktop_ocr or desktop_screenshot after this returns to
+    read the new screen state.
+
+    Tip: Use a narrow region (e.g. just the status bar or output area) for
+    faster, more sensitive detection. Full-screen diff on 1080p has more
+    noise (cursor movement, clock ticking) than a focused region.
+    """
+    from tools.pc_vision import watch_region_for_change
+    result = await watch_region_for_change(
+        region=region,
+        change_threshold=change_threshold,
+        timeout_s=timeout_s,
+        poll_s=poll_s,
+    )
+    return ok(result)
 
 
 # ----------------------------------------------------------------------
@@ -176,6 +391,9 @@ async def desktop_click(
 
     For double-click pass clicks=2. For right-click pass button="right".
     Set confirm_screenshot=True to verify the click landed before typing.
+
+    To click text you found with desktop_find_text, use the returned
+    click_x and click_y values directly as x and y here.
     """
     from tools.mouse_kb import mouse_click as legacy
     msg = await legacy(x, y, button=button, clicks=clicks, confirm_screenshot=confirm_screenshot)
@@ -302,13 +520,12 @@ async def desktop_wait(ms: int = 500, reason: str = "") -> dict:
       - You pressed a hotkey and need the UI to respond before reading the screen.
       - You are about to type and the focus target was slow to appear.
 
-    Typical values:
-      - 300–500ms  : normal button/menu/focus transition
-      - 800–1500ms : dialog opening, browser tab loading
-      - 2000–5000ms: app launch (Notepad, Explorer, IDE)
-      - 5000–10000ms: heavy app launch (browser cold start, IDE indexing)
+    PREFER desktop_watch or desktop_wait_for_text over this tool when possible.
+    Those tools return as soon as the screen reacts rather than burning a fixed
+    delay — they are faster and more reliable.
 
-    Always follow with desktop_screenshot to confirm the UI is ready.
+    Use desktop_wait only when you need an unconditional pause (e.g. giving
+    a laggy input field time to receive focus before typing).
     """
     await asyncio.sleep(ms / 1000.0)
     return ok({"waited_ms": ms, "reason": reason or "(no reason given)"})
@@ -350,6 +567,12 @@ async def desktop_type(text: str, interval: float = 0.05) -> dict:
          slow apps) OR call desktop_wait (500-1000ms for dialogs/browsers).
       3. Optionally desktop_screenshot to confirm the cursor is in the field.
 
+    VERIFY AFTER TYPING:
+      Use desktop_ocr on the input region to confirm the text appeared
+      correctly. This is faster and more reliable than a screenshot.
+      If the OCR text does not match what you typed, retry with a higher
+      interval or use desktop_hotkey('ctrl+a') to clear first.
+
     Behaviour:
       - Short text with only letters/digits/basic punctuation: typed directly
         key-by-key at `interval` seconds per character.
@@ -357,11 +580,6 @@ async def desktop_type(text: str, interval: float = 0.05) -> dict:
         characters: sent via clipboard paste (Ctrl+V) automatically.
       - The result includes 'method' ('direct_write' or 'clipboard') so you
         can diagnose drops.
-
-    If characters are still being dropped after following prerequisites:
-      - Increase interval to 0.10.
-      - Use desktop_hotkey('ctrl+a') first to clear the field.
-      - Consider shell_run for programmatic input instead of GUI typing.
     """
     from tools.mouse_kb import keyboard_type as legacy
     msg = await legacy(text, interval=interval)
