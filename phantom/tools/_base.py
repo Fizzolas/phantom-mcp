@@ -198,6 +198,11 @@ def _safe_import_tool_module(mod_path: str) -> bool:
     try:
         importlib.import_module(mod_path)
         return True
-    except Exception as e:  # noqa: BLE001
-        log.warning("skipping tool module %s: %s", mod_path, e)
+    # Issue 3 fix: only silently skip on import failures (missing optional dep).
+    # Any other exception is a real bug in the tool module — surface it fully.
+    except (ImportError, ModuleNotFoundError) as e:
+        log.warning("skipping tool module %s (missing dep): %s", mod_path, e)
+        return False
+    except Exception:
+        log.exception("tool module %s failed to load (non-import error)", mod_path)
         return False

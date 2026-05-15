@@ -55,7 +55,9 @@ _stderr.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"
 log.addHandler(_file)
 log.addHandler(_stderr)
 log.propagate = False
-print("phantom-mcp v2 starting...", file=sys.stderr, flush=True)
+
+# Issue 2 fix: log after handlers are attached, not before.
+log.info("phantom-mcp v2 starting...")
 
 # ---- phantom internals -----------------------------------------------------
 from phantom.contracts import ToolResult, fail
@@ -84,18 +86,33 @@ async def _refresh_runtime_state() -> None:
     caps = probe_capabilities()
     registry.set_capabilities(caps)
 
-    probe = await probe_lmstudio()
-    _LMS_INFO = probe.as_dict()
-    _BUDGET = TokenBudget(context_length=probe.context_length)
+    # Issue 1 fix: use `lms_probe` so we don't shadow the imported `probe_lmstudio`.
+    lms_probe = await probe_lmstudio()
+    _LMS_INFO = lms_probe.as_dict()
+    _BUDGET = TokenBudget(context_length=lms_probe.context_length)
     log.info(
         "boot: capabilities=%s lms_reachable=%s model=%s ctx=%s",
-        sorted(caps), probe.reachable, probe.model_id, probe.context_length,
+        sorted(caps), lms_probe.reachable, lms_probe.model_id, lms_probe.context_length,
     )
 
 
 # ---- MCP server ------------------------------------------------------------
 app = Server("phantom-mcp")
-_tools_list_logged = False
+
+# Issue 4 fix: use a logging Filter as a thread-safe once-flag instead of a
+# mutable global bool. The filter fires exactly once, then deactivates itself.
+class _OnceFilter(logging.Filter):
+    def __init__(self) -> None:
+        super().__init__()
+        self._fired = False
+
+    def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
+        if self._fired:
+            return False
+        self._fired = True
+        return True
+
+_list_tools_once = _OnceFilter()
 
 
 def _spec_to_mcp_tool(spec) -> types.Tool:
@@ -113,11 +130,13 @@ def _spec_to_mcp_tool(spec) -> types.Tool:
 
 @app.list_tools()
 async def list_tools() -> list[types.Tool]:
-    global _tools_list_logged
     available = registry.available()
-    if not _tools_list_logged:
-        log.info("list_tools: %d tools advertised (of %d total)", len(available), len(registry.all()))
-        _tools_list_logged = True
+    _once_log = logging.getLogger("phantom.list_tools.once")
+    if not _once_log.filters:
+        _once_log.addFilter(_list_tools_once)
+    _once_log.info(
+        "list_tools: %d tools advertised (of %d total)", len(available), len(registry.all())
+    )
     return [_spec_to_mcp_tool(s) for s in available]
 
 
@@ -161,7 +180,7 @@ async def call_tool(name: str, arguments: dict | None = None) -> list[types.Text
 # ---- entry point -----------------------------------------------------------
 async def _main() -> None:
     await _refresh_runtime_state()
-    print(f"phantom-mcp v2 ready: {len(registry.available())} tools advertised.", file=sys.stderr, flush=True)
+    log.info("phantom-mcp v2 ready: %d tools advertised.", len(registry.available()))
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
 
