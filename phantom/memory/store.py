@@ -33,16 +33,24 @@ Public API:
 The store is process-local and file-backed. Concurrency is async-safe
 within a single process via an asyncio.Lock; we don't promise multi-
 process write safety because phantom is intended to run as one server.
+
+Pass 4 notes:
+  Issue 1 — all write methods are now `async def` and acquire self._lock.
+  Issue 2 — compact() uses atomic tmp→rename for traces.jsonl rewrite.
+  Issue 3 — _read_json() logs + renames corrupt files before returning default.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
+
+log = logging.getLogger(__name__)
 
 # Soft cap on a single trace record's size — keep traces grep-friendly.
 TRACE_ARGS_PREVIEW = 280
@@ -74,12 +82,34 @@ class PhantomMemory:
     # Disk helpers
     # ------------------------------------------------------------------
     def _read_json(self, name: str, default):
+        """
+        Read a JSON file from the data directory.
+
+        Pass 4 Issue 3: if the file is unreadable or corrupt, log at
+        error level, rename the bad file to <name>.corrupt.<ts> for
+        post-mortem inspection, then return `default` so the server
+        keeps running rather than crashing on startup.
+        """
         p = self.dir / name
         if not p.exists():
             return default
         try:
             return json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as e:
+            ts = int(time.time())
+            backup = p.with_suffix(p.suffix + f".corrupt.{ts}")
+            try:
+                p.rename(backup)
+                log.error(
+                    "memory file %s is corrupt (%s) — reset to default; "
+                    "corrupt copy saved at %s",
+                    p, e, backup,
+                )
+            except Exception as rename_err:
+                log.error(
+                    "memory file %s is corrupt (%s) and could not be renamed: %s",
+                    p, e, rename_err,
+                )
             return default
 
     def _write_json(self, name: str, payload):
@@ -91,10 +121,15 @@ class PhantomMemory:
     # ------------------------------------------------------------------
     # FACTS
     # ------------------------------------------------------------------
-    def fact_set(self, key: str, value: str) -> dict:
-        self._facts[key] = {"value": value, "updated": time.time()}
-        self._write_json("facts.json", self._facts)
-        return {"ok": True, "key": key, "chars": len(value)}
+    async def fact_set(self, key: str, value: str) -> dict:
+        """
+        Pass 4 Issue 1: async + locked so concurrent tool calls can't
+        interleave reads and writes on the same facts dict.
+        """
+        async with self._lock:
+            self._facts[key] = {"value": value, "updated": time.time()}
+            self._write_json("facts.json", self._facts)
+            return {"ok": True, "key": key, "chars": len(value)}
 
     def fact_get(self, key: str) -> dict:
         entry = self._facts.get(key)
@@ -102,12 +137,13 @@ class PhantomMemory:
             return {"ok": False, "error": f"no fact named {key!r}"}
         return {"ok": True, "key": key, "value": entry["value"], "updated": entry.get("updated")}
 
-    def fact_delete(self, key: str) -> dict:
-        if key in self._facts:
-            del self._facts[key]
-            self._write_json("facts.json", self._facts)
-            return {"ok": True, "deleted": key}
-        return {"ok": False, "error": f"no fact named {key!r}"}
+    async def fact_delete(self, key: str) -> dict:
+        async with self._lock:
+            if key in self._facts:
+                del self._facts[key]
+                self._write_json("facts.json", self._facts)
+                return {"ok": True, "deleted": key}
+            return {"ok": False, "error": f"no fact named {key!r}"}
 
     def fact_list(self) -> list[str]:
         return sorted(self._facts.keys())
@@ -137,46 +173,49 @@ class PhantomMemory:
     # ------------------------------------------------------------------
     # TASKS
     # ------------------------------------------------------------------
-    def task_start(self, task_id: str, goal: str) -> dict:
-        self._tasks[task_id] = {
-            "goal": goal,
-            "status": "in_progress",
-            "steps": [],
-            "summary": "",
-            "created": time.time(),
-            "updated": time.time(),
-        }
-        self._write_json("tasks.json", self._tasks)
-        return {"ok": True, "task_id": task_id}
+    async def task_start(self, task_id: str, goal: str) -> dict:
+        async with self._lock:
+            self._tasks[task_id] = {
+                "goal": goal,
+                "status": "in_progress",
+                "steps": [],
+                "summary": "",
+                "created": time.time(),
+                "updated": time.time(),
+            }
+            self._write_json("tasks.json", self._tasks)
+            return {"ok": True, "task_id": task_id}
 
-    def task_step(self, task_id: str, step: str, ok: bool = True, detail: str = "") -> dict:
-        task = self._tasks.get(task_id) or {
-            "goal": task_id, "status": "in_progress", "steps": [],
-            "summary": "", "created": time.time(),
-        }
-        task["steps"].append({
-            "ts": time.time(),
-            "step": step,
-            "ok": bool(ok),
-            "detail": detail[:TRACE_ARGS_PREVIEW] if detail else "",
-        })
-        if len(task["steps"]) > 100:
-            task["steps"] = task["steps"][-100:]
-        task["updated"] = time.time()
-        self._tasks[task_id] = task
-        self._write_json("tasks.json", self._tasks)
-        return {"ok": True, "task_id": task_id, "step_count": len(task["steps"])}
+    async def task_step(self, task_id: str, step: str, ok: bool = True, detail: str = "") -> dict:
+        async with self._lock:
+            task = self._tasks.get(task_id) or {
+                "goal": task_id, "status": "in_progress", "steps": [],
+                "summary": "", "created": time.time(),
+            }
+            task["steps"].append({
+                "ts": time.time(),
+                "step": step,
+                "ok": bool(ok),
+                "detail": detail[:TRACE_ARGS_PREVIEW] if detail else "",
+            })
+            if len(task["steps"]) > 100:
+                task["steps"] = task["steps"][-100:]
+            task["updated"] = time.time()
+            self._tasks[task_id] = task
+            self._write_json("tasks.json", self._tasks)
+            return {"ok": True, "task_id": task_id, "step_count": len(task["steps"])}
 
-    def task_finish(self, task_id: str, status: str = "done", summary: str = "") -> dict:
-        task = self._tasks.get(task_id)
-        if task is None:
-            return {"ok": False, "error": f"unknown task {task_id!r}"}
-        task["status"] = status
-        if summary:
-            task["summary"] = summary
-        task["updated"] = time.time()
-        self._write_json("tasks.json", self._tasks)
-        return {"ok": True, "task_id": task_id, "status": status}
+    async def task_finish(self, task_id: str, status: str = "done", summary: str = "") -> dict:
+        async with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return {"ok": False, "error": f"unknown task {task_id!r}"}
+            task["status"] = status
+            if summary:
+                task["summary"] = summary
+            task["updated"] = time.time()
+            self._write_json("tasks.json", self._tasks)
+            return {"ok": True, "task_id": task_id, "status": status}
 
     def task_get(self, task_id: str) -> dict:
         task = self._tasks.get(task_id)
@@ -200,7 +239,7 @@ class PhantomMemory:
     # ------------------------------------------------------------------
     # TRACES (action history; basis for self-learning)
     # ------------------------------------------------------------------
-    def trace_append(
+    async def trace_append(
         self,
         tool: str,
         args: dict | None,
@@ -219,8 +258,9 @@ class PhantomMemory:
             "category": category,
             "latency_ms": latency_ms,
         }
-        with (self.dir / "traces.jsonl").open("a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        async with self._lock:
+            with (self.dir / "traces.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     def trace_recent(self, limit: int = 20, tool: str | None = None) -> list[dict]:
         traces = list(self._read_traces())
@@ -249,10 +289,11 @@ class PhantomMemory:
     # ------------------------------------------------------------------
     # LESSONS (distilled action knowledge)
     # ------------------------------------------------------------------
-    def lesson_set(self, name: str, body: str, *, source: str = "manual") -> dict:
-        self._lessons[name] = {"body": body, "updated": time.time(), "source": source}
-        self._write_json("lessons.json", self._lessons)
-        return {"ok": True, "name": name}
+    async def lesson_set(self, name: str, body: str, *, source: str = "manual") -> dict:
+        async with self._lock:
+            self._lessons[name] = {"body": body, "updated": time.time(), "source": source}
+            self._write_json("lessons.json", self._lessons)
+            return {"ok": True, "name": name}
 
     def lesson_get(self, name: str) -> dict | None:
         return self._lessons.get(name)
@@ -263,17 +304,18 @@ class PhantomMemory:
             for k, v in self._lessons.items()
         ]
 
-    def lesson_delete(self, name: str) -> dict:
-        if name in self._lessons:
-            del self._lessons[name]
-            self._write_json("lessons.json", self._lessons)
-            return {"ok": True, "deleted": name}
-        return {"ok": False, "error": f"no lesson named {name!r}"}
+    async def lesson_delete(self, name: str) -> dict:
+        async with self._lock:
+            if name in self._lessons:
+                del self._lessons[name]
+                self._write_json("lessons.json", self._lessons)
+                return {"ok": True, "deleted": name}
+            return {"ok": False, "error": f"no lesson named {name!r}"}
 
     # ------------------------------------------------------------------
     # NOTES (large free-form text; chunked retrieval)
     # ------------------------------------------------------------------
-    def note_save(self, label: str, text: str) -> dict:
+    async def note_save(self, label: str, text: str) -> dict:
         chunks = [
             text[i : i + self.config.note_chunk_chars]
             for i in range(0, len(text), self.config.note_chunk_chars)
@@ -285,11 +327,12 @@ class PhantomMemory:
             "chunk_chars": self.config.note_chunk_chars,
             "updated": time.time(),
         }
-        out_dir = self.dir / "notes" / _safe_filename(label)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        for i, c in enumerate(chunks):
-            (out_dir / f"chunk_{i:04d}.txt").write_text(c, encoding="utf-8")
-        (out_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        async with self._lock:
+            out_dir = self.dir / "notes" / _safe_filename(label)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            for i, c in enumerate(chunks):
+                (out_dir / f"chunk_{i:04d}.txt").write_text(c, encoding="utf-8")
+            (out_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
         return {"ok": True, **meta}
 
     def note_load(self, label: str, index: int = 0) -> dict:
@@ -364,7 +407,6 @@ class PhantomMemory:
         for tool_name, fails in failures.items():
             if len(fails) < 2:
                 continue
-            # Extract the most common error category and a short pattern.
             cats = [f.get("category") for f in fails if f.get("category")]
             cat = max(set(cats), key=cats.count) if cats else "unknown"
             sample_err = fails[-1].get("error") or ""
@@ -384,7 +426,7 @@ class PhantomMemory:
                 except Exception:
                     pass  # fall back to heuristic body
 
-            self.lesson_set(f"auto:{tool_name}", body, source="auto")
+            await self.lesson_set(f"auto:{tool_name}", body, source="auto")
             learned.append(tool_name)
 
         return {
@@ -394,11 +436,14 @@ class PhantomMemory:
             "tools_with_failures": list(failures.keys()),
         }
 
-    def compact(self, target_chars: int = 20_000) -> dict:
+    async def compact(self, target_chars: int = 20_000) -> dict:
         """
         Trim trace log to last N records. Records older than that are
         replaced by an aggregate summary appended into facts under
         `trace_summary:<timestamp>` so we never lose the long-term shape.
+
+        Pass 4 Issue 2: traces.jsonl is rewritten atomically via a
+        .jsonl.tmp file renamed into place, matching _write_json's pattern.
         """
         traces = list(self._read_traces())
         if len(traces) <= self.config.trace_keep_after_compact:
@@ -406,7 +451,6 @@ class PhantomMemory:
 
         cutoff = len(traces) - self.config.trace_keep_after_compact
         old, kept = traces[:cutoff], traces[cutoff:]
-        # Aggregate summary
         per_tool: dict[str, dict] = {}
         for t in old:
             name = t.get("tool", "?")
@@ -421,10 +465,17 @@ class PhantomMemory:
             "per_tool": per_tool,
         }
         ts = int(time.time())
-        self.fact_set(f"trace_summary:{ts}", json.dumps(summary, ensure_ascii=False))
-        # Rewrite traces.jsonl with kept-only.
+        # Write summary fact first (already atomic via _write_json inside fact_set).
+        await self.fact_set(f"trace_summary:{ts}", json.dumps(summary, ensure_ascii=False))
+        # Atomically rewrite traces.jsonl via a tmp file.
         p = self.dir / "traces.jsonl"
-        p.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept), encoding="utf-8")
+        tmp = p.with_suffix(".jsonl.tmp")
+        async with self._lock:
+            tmp.write_text(
+                "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept),
+                encoding="utf-8",
+            )
+            tmp.replace(p)
         return {"ok": True, "trimmed": True, "kept": len(kept), "summary_key": f"trace_summary:{ts}"}
 
 

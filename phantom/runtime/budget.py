@@ -23,6 +23,11 @@ sentinel so the model knows more exists:
 
     "...<output truncated: 4821 of 18400 chars shown; call with
      raw=True or narrow your query>..."
+
+Pass 4 Issue 5:
+  tiktoken encoder is now cached at module level in _TIKTOKEN_ENC so
+  tiktoken.get_encoding() is called at most once per process, not on
+  every estimate_tokens() invocation.
 """
 from __future__ import annotations
 
@@ -31,6 +36,14 @@ from dataclasses import dataclass
 # Rough heuristic when tiktoken isn't available. 4 chars/token is the
 # OpenAI rule-of-thumb; local models vary but this keeps us safe-ish.
 CHARS_PER_TOKEN_HEURISTIC = 4
+
+# Pass 4 Issue 5: cache the encoder at module load time so we only pay
+# the BPE vocab load cost once per process lifetime.
+try:
+    import tiktoken as _tiktoken  # type: ignore
+    _TIKTOKEN_ENC = _tiktoken.get_encoding("cl100k_base")
+except Exception:
+    _TIKTOKEN_ENC = None
 
 
 @dataclass
@@ -60,13 +73,9 @@ class TokenBudget:
     def estimate_tokens(self, text: str) -> int:
         if not text:
             return 0
-        try:
-            import tiktoken  # type: ignore
-
-            enc = tiktoken.get_encoding("cl100k_base")
-            return len(enc.encode(text))
-        except Exception:
-            return max(1, len(text) // CHARS_PER_TOKEN_HEURISTIC)
+        if _TIKTOKEN_ENC is not None:
+            return len(_TIKTOKEN_ENC.encode(text))
+        return max(1, len(text) // CHARS_PER_TOKEN_HEURISTIC)
 
     # ------------------------------------------------------------------
     # Truncation
