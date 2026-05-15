@@ -50,7 +50,12 @@ class LMStudioProbe:
 
 
 _cache: LMStudioProbe | None = None
-_cache_lock = asyncio.Lock()
+# Pass 3 Issue 1: do NOT create the Lock at module-import time.
+# asyncio.Lock() created before the event loop starts has no loop to bind to
+# and raises RuntimeError when first awaited in some Python/asyncio versions.
+# Lazy-init inside probe_lmstudio() guarantees the lock is always created on
+# the running event loop.
+_cache_lock: asyncio.Lock | None = None
 
 
 async def probe_lmstudio(
@@ -64,7 +69,10 @@ async def probe_lmstudio(
     `force=True` bypasses the cache (call this when the user explicitly
     swaps models or the server suspects staleness).
     """
-    global _cache
+    global _cache, _cache_lock
+    # Lazy-initialise on first call from the running event loop.
+    if _cache_lock is None:
+        _cache_lock = asyncio.Lock()
     async with _cache_lock:
         now = time.time()
         if (
@@ -98,41 +106,48 @@ async def _probe_via_sdk() -> LMStudioProbe | None:
     """
     Preferred path: LM Studio's official Python SDK. Surfaces exact context
     length via model.get_context_length().
+
+    Pass 3 Issue 2: use AsyncClient directly instead of running the sync
+    Client() inside asyncio.to_thread(). The sync Client wraps async
+    internals with loop.run_until_complete(), which raises
+    'This event loop is already running' when called from a thread
+    spawned by the already-running loop. Fall back to REST on any error,
+    including SDK versions that don't expose AsyncClient yet.
     """
     try:
         import lmstudio  # type: ignore
     except Exception:
         return None
 
-    def _work() -> LMStudioProbe:
-        try:
-            client = lmstudio.Client()  # type: ignore[attr-defined]
-            # `llm.model()` returns the currently loaded model handle.
-            model = client.llm.model()
-            ctx = int(model.get_context_length())
-            mid = getattr(model, "identifier", None) or getattr(model, "id", None) or "unknown"
-            return LMStudioProbe(
-                reachable=True,
-                model_id=str(mid),
-                context_length=ctx,
-                supports_tools=True,  # SDK path implies tool-use is available.
-                raw={"via": "sdk"},
-            )
-        except Exception as e:
-            return LMStudioProbe(
-                reachable=False,
-                error=f"sdk probe failed: {e!s}",
-                raw={"via": "sdk"},
-            )
-
     try:
-        return await asyncio.wait_for(asyncio.to_thread(_work), timeout=PROBE_TIMEOUT_S)
-    except asyncio.TimeoutError:
+        # Prefer the async client path (avoids blocking the event loop).
+        async_client_cls = getattr(lmstudio, "AsyncClient", None)
+        if async_client_cls is not None:
+            async with async_client_cls() as client:
+                model = await client.llm.model()
+                ctx = int(await model.get_context_length())
+                mid = (
+                    getattr(model, "identifier", None)
+                    or getattr(model, "id", None)
+                    or "unknown"
+                )
+                return LMStudioProbe(
+                    reachable=True,
+                    model_id=str(mid),
+                    context_length=ctx,
+                    supports_tools=True,
+                    raw={"via": "sdk_async"},
+                )
+    except Exception as e:
         return LMStudioProbe(
             reachable=False,
-            error="sdk probe timed out",
-            raw={"via": "sdk"},
+            error=f"sdk async probe failed: {e!s}",
+            raw={"via": "sdk_async"},
         )
+
+    # AsyncClient not available on this SDK version — signal the caller to
+    # fall through to REST rather than attempting the blocking sync path.
+    return None
 
 
 async def _probe_via_rest(base_url: str) -> LMStudioProbe:

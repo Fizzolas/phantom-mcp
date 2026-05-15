@@ -17,9 +17,18 @@ defined helper that:
 
 All outputs are bounded by character caps so the runtime token-budget
 manager never has to throw away the most useful state.
+
+Concurrency note (Pass 3 Issue 4):
+  Methods that perform read-modify-write on per-task plan state
+  (plan_advance, plan_set, replan, checkpoint, after_action_review) hold
+  a per-task asyncio.Lock while they operate. Read-only methods are
+  lock-free. The lock dict itself (_task_locks) is guarded by a small
+  meta-lock (_locks_lock) so concurrent first-access for the same
+  task_id never races on lock creation.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -86,6 +95,20 @@ class AgentCognition:
 
     def __init__(self, memory: PhantomMemory) -> None:
         self.mem = memory
+        # Pass 3 Issue 4: per-task locks for read-modify-write methods.
+        # _locks_lock guards the dict itself against concurrent first-access
+        # for the same task_id.
+        self._task_locks: dict[str, asyncio.Lock] = {}
+        self._locks_lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # Internal: acquire the per-task lock (creates it on first use).
+    # ------------------------------------------------------------------
+    async def _task_lock(self, task_id: str) -> asyncio.Lock:
+        async with self._locks_lock:
+            if task_id not in self._task_locks:
+                self._task_locks[task_id] = asyncio.Lock()
+            return self._task_locks[task_id]
 
     # ------------------------------------------------------------------
     # GOAL + PLAN
@@ -133,7 +156,7 @@ class AgentCognition:
             ),
         }
 
-    def plan_set(self, task_id: str, steps: list[str]) -> dict:
+    async def plan_set(self, task_id: str, steps: list[str]) -> dict:
         """
         Store an ordered plan. The plan lives as a fact named
         plan:<task_id> so it survives across calls and sessions, and is
@@ -151,14 +174,16 @@ class AgentCognition:
         if not cleaned:
             return {"ok": False, "error": "plan must have at least one step"}
 
-        plan_doc = {"steps": cleaned, "cursor": 0, "updated": time.time()}
-        self.mem.fact_set(f"plan:{task_id}", json.dumps(plan_doc, ensure_ascii=False))
-        self.mem.task_step(
-            task_id,
-            step=f"plan_set ({len(cleaned)} steps)",
-            ok=True,
-            detail=" | ".join(f"{i+1}. {s}" for i, s in enumerate(cleaned))[:280],
-        )
+        lock = await self._task_lock(task_id)
+        async with lock:
+            plan_doc = {"steps": cleaned, "cursor": 0, "updated": time.time()}
+            self.mem.fact_set(f"plan:{task_id}", json.dumps(plan_doc, ensure_ascii=False))
+            self.mem.task_step(
+                task_id,
+                step=f"plan_set ({len(cleaned)} steps)",
+                ok=True,
+                detail=" | ".join(f"{i+1}. {s}" for i, s in enumerate(cleaned))[:280],
+            )
         return {"ok": True, "task_id": task_id, "step_count": len(cleaned)}
 
     def _load_plan(self, task_id: str) -> dict | None:
@@ -174,24 +199,26 @@ class AgentCognition:
         plan["updated"] = time.time()
         self.mem.fact_set(f"plan:{task_id}", json.dumps(plan, ensure_ascii=False))
 
-    def plan_advance(self, task_id: str, *, step_ok: bool, note: str = "") -> dict:
+    async def plan_advance(self, task_id: str, *, step_ok: bool, note: str = "") -> dict:
         """Mark the current step done (or failed) and move the cursor."""
-        plan = self._load_plan(task_id)
-        if plan is None:
-            return {"ok": False, "error": f"no plan stored for {task_id!r}"}
-        cursor = plan.get("cursor", 0)
-        steps = plan.get("steps", [])
-        if cursor >= len(steps):
-            return {"ok": True, "task_id": task_id, "done": True, "cursor": cursor}
-        current = steps[cursor]
-        plan["cursor"] = cursor + 1
-        self._save_plan(task_id, plan)
-        self.mem.task_step(
-            task_id,
-            step=f"plan_step[{cursor}]: {current}",
-            ok=bool(step_ok),
-            detail=note[:PLAN_STEP_CHARS],
-        )
+        lock = await self._task_lock(task_id)
+        async with lock:
+            plan = self._load_plan(task_id)
+            if plan is None:
+                return {"ok": False, "error": f"no plan stored for {task_id!r}"}
+            cursor = plan.get("cursor", 0)
+            steps = plan.get("steps", [])
+            if cursor >= len(steps):
+                return {"ok": True, "task_id": task_id, "done": True, "cursor": cursor}
+            current = steps[cursor]
+            plan["cursor"] = cursor + 1
+            self._save_plan(task_id, plan)
+            self.mem.task_step(
+                task_id,
+                step=f"plan_step[{cursor}]: {current}",
+                ok=bool(step_ok),
+                detail=note[:PLAN_STEP_CHARS],
+            )
         return {
             "ok": True,
             "task_id": task_id,
@@ -424,7 +451,7 @@ class AgentCognition:
     # ------------------------------------------------------------------
     # CHECKPOINT + AFTER-ACTION REVIEW
     # ------------------------------------------------------------------
-    def checkpoint(
+    async def checkpoint(
         self,
         task_id: str,
         *,
@@ -440,22 +467,24 @@ class AgentCognition:
         if not intent or not expected:
             return {"ok": False, "error": "intent and expected must be non-empty"}
         cp_id = f"cp:{task_id}:{int(time.time() * 1000)}"
-        self.mem.fact_set(
-            cp_id,
-            json.dumps(
-                {"task_id": task_id, "intent": intent, "expected": expected, "ts": time.time()},
-                ensure_ascii=False,
-            ),
-        )
-        self.mem.task_step(
-            task_id,
-            step=f"checkpoint: {intent}",
-            ok=True,
-            detail=f"expected: {expected}",
-        )
+        lock = await self._task_lock(task_id)
+        async with lock:
+            self.mem.fact_set(
+                cp_id,
+                json.dumps(
+                    {"task_id": task_id, "intent": intent, "expected": expected, "ts": time.time()},
+                    ensure_ascii=False,
+                ),
+            )
+            self.mem.task_step(
+                task_id,
+                step=f"checkpoint: {intent}",
+                ok=True,
+                detail=f"expected: {expected}",
+            )
         return {"ok": True, "checkpoint_id": cp_id}
 
-    def after_action_review(
+    async def after_action_review(
         self,
         checkpoint_id: str,
         *,
@@ -481,37 +510,38 @@ class AgentCognition:
         intent = cp.get("intent", "")
         expected = cp.get("expected", "")
 
-        diff_summary = _compare(expected, observed_clipped)
-        self.mem.task_step(
-            task_id,
-            step=f"AAR: {intent}",
-            ok=bool(success),
-            detail=f"expected={expected[:120]} | observed={observed_clipped[:120]} | diff={diff_summary}",
-        )
-
-        promoted = None
-        if success and promote_lesson:
-            # Only promote if we have at least 2 successful AARs with
-            # similar intent — cheap durability check.
-            recent = [
-                t for t in self.mem.trace_recent(limit=200)
-                if t.get("tool") in {"agent_after_action_review", "agent_checkpoint"}
-            ]
-            similar = sum(
-                1 for t in recent
-                if (t.get("args") or {}).get("intent", "").startswith(intent[:40])
+        lock = await self._task_lock(task_id)
+        async with lock:
+            diff_summary = _compare(expected, observed_clipped)
+            self.mem.task_step(
+                task_id,
+                step=f"AAR: {intent}",
+                ok=bool(success),
+                detail=f"expected={expected[:120]} | observed={observed_clipped[:120]} | diff={diff_summary}",
             )
-            if similar >= 2:
-                lesson_name = f"agent:{_slug(intent)[:40]}"
-                lesson_body = (
-                    f"When intent is '{intent[:120]}', expecting '{expected[:120]}' "
-                    f"reliably worked. Reuse this approach instead of exploring."
-                )
-                self.mem.lesson_set(lesson_name, lesson_body, source="auto-aar")
-                promoted = lesson_name
 
-        # Cleanup: keep facts space tight by deleting checkpoints once reviewed.
-        self.mem.fact_delete(checkpoint_id)
+            promoted = None
+            if success and promote_lesson:
+                recent = [
+                    t for t in self.mem.trace_recent(limit=200)
+                    if t.get("tool") in {"agent_after_action_review", "agent_checkpoint"}
+                ]
+                similar = sum(
+                    1 for t in recent
+                    if (t.get("args") or {}).get("intent", "").startswith(intent[:40])
+                )
+                if similar >= 2:
+                    lesson_name = f"agent:{_slug(intent)[:40]}"
+                    lesson_body = (
+                        f"When intent is '{intent[:120]}', expecting '{expected[:120]}' "
+                        f"reliably worked. Reuse this approach instead of exploring."
+                    )
+                    self.mem.lesson_set(lesson_name, lesson_body, source="auto-aar")
+                    promoted = lesson_name
+
+            # Cleanup: keep facts space tight by deleting checkpoints once reviewed.
+            self.mem.fact_delete(checkpoint_id)
+
         return {
             "ok": True,
             "checkpoint_id": checkpoint_id,
@@ -571,8 +601,7 @@ class AgentCognition:
             if f["tool"] and f["tool"].lower() in low
         ]
 
-        # Heuristic assumptions/missing-info detection. These are deliberately
-        # opinionated nudges so a small model has something concrete to react to.
+        # Heuristic assumptions/missing-info detection.
         assumptions: list[str] = []
         missing_info: list[str] = []
         if kind in {"action", "plan"}:
@@ -608,8 +637,6 @@ class AgentCognition:
         if kind == "answer":
             likely_consequences.append("user trusts the answer; an error here propagates")
 
-        # Recommendation logic — favors caution when info is missing or the
-        # operation is irreversible without supporting evidence.
         if reversibility == "irreversible" and not evidence_facts:
             recommendation = "do_not_act"
         elif missing_info:
@@ -619,9 +646,6 @@ class AgentCognition:
         else:
             recommendation = "proceed"
 
-        # Plan-context awareness: if a task_id is supplied, surface the
-        # active plan step so understand() can warn when the action does
-        # not match the plan.
         plan_alignment = None
         if task_id:
             plan = self._load_plan(task_id) or {"steps": [], "cursor": 0}
@@ -671,36 +695,26 @@ class AgentCognition:
     ) -> dict:
         """
         Compute a deterministic 0..100 confidence score for a proposed
-        goal/action/answer, plus a band ('high'|'moderate'|'low'|'very_low')
-        and a go/caution/block recommendation. Combines:
-          - strength of evidence (facts that match subject)
-          - whether the proposal aligns with the active plan
-          - recent failure rate of the named tool
-          - reversibility / risk signals from understand() and risk_check()
-
-        Output is bounded and JSON-friendly for context windows.
+        goal/action/answer.
         """
         u = self.understand(subject, kind=kind, task_id=task_id)
         if not u.get("ok"):
             return u
 
-        score = 50  # neutral baseline
+        score = 50
 
-        # Evidence boosts confidence.
         ev_facts = u["evidence"]["facts"]
         if ev_facts:
             score += min(20, 5 * len(ev_facts))
         if u["evidence"]["lessons"]:
             score += 5
 
-        # Missing info / irreversible drags it down.
         score -= 10 * len(u["missing_info"])
         if u["reversibility"] == "irreversible":
             score -= 15
         elif u["reversibility"] == "partial":
             score -= 5
 
-        # Plan alignment.
         pa = u.get("plan_alignment")
         if pa is not None:
             if pa.get("matches_subject"):
@@ -708,7 +722,6 @@ class AgentCognition:
             elif pa.get("current_step"):
                 score -= 15
 
-        # Tool-level history: if the named tool has failed recently, dock points.
         tool_failure_ratio = None
         if tool_name:
             recent = self.mem.trace_recent(limit=40, tool=tool_name)
@@ -722,7 +735,6 @@ class AgentCognition:
                 elif tool_failure_ratio == 0 and len(recent) >= 5:
                     score += 5
 
-        # Risk-check overlay for action kind.
         risk = None
         if kind == "action" and tool_name:
             risk = self.risk_check(tool_name, args or {})
@@ -734,7 +746,6 @@ class AgentCognition:
         score = max(0, min(100, score))
         band = next(name for thr, name in CONFIDENCE_BANDS if score >= thr)
 
-        # Decision matrix: (band, risk_level) -> recommendation.
         if band == "very_low" or (risk and risk["level"] == "block"):
             decision = "block"
         elif band == "low" or (risk and risk["level"] == "caution"):
@@ -786,10 +797,6 @@ class AgentCognition:
         conf = self.confidence_check(
             subject, kind="action", task_id=task_id, tool_name=tool_name, args=args
         )
-        # confidence_check internally calls risk_check too, but exposing
-        # both gives the caller the granular factors plus the summary
-        # decision in one packet.
-        # Merge into a single structured recommendation.
         if risk["level"] == "block" or conf["decision"] == "block":
             verdict = "block"
         elif risk["level"] == "caution" or conf["decision"] == "caution":
@@ -822,10 +829,7 @@ class AgentCognition:
     # ------------------------------------------------------------------
     def stuck_detect(self, task_id: str | None = None) -> dict:
         """
-        Detect repeated failures or thrashing and recommend a recovery
-        path. Pure heuristic — looks at the last STUCK_RECENT_WINDOW
-        trace entries (optionally scoped to a task by inspecting the
-        task's step log).
+        Detect repeated failures or thrashing and recommend a recovery path.
         """
         traces = self.mem.trace_recent(limit=STUCK_RECENT_WINDOW)
         signals: list[str] = []
@@ -842,14 +846,9 @@ class AgentCognition:
 
         fails = [t for t in traces if not t.get("ok")]
         if len(fails) >= STUCK_FAILURE_THRESHOLD:
-            signals.append(
-                f"{len(fails)}/{len(traces)} recent calls failed"
-            )
-            suggestions.append(
-                "stop retrying — call agent_replan or ask the user for guidance"
-            )
+            signals.append(f"{len(fails)}/{len(traces)} recent calls failed")
+            suggestions.append("stop retrying — call agent_replan or ask the user for guidance")
 
-        # Same tool + similar args repeated.
         tool_streak = 1
         for i in range(len(traces) - 1, 0, -1):
             if traces[i].get("tool") == traces[i - 1].get("tool"):
@@ -862,7 +861,6 @@ class AgentCognition:
                 "vary approach — last N calls used the same tool; try a different one or add a verification step"
             )
 
-        # Plan unchanged across many traces (no plan_advance in recent traces).
         recent_plan_advances = [t for t in traces if t.get("tool") == "agent_plan_advance"]
         if not recent_plan_advances and len(traces) >= 5:
             signals.append("no agent_plan_advance in recent traces")
@@ -870,7 +868,6 @@ class AgentCognition:
                 "you may be off-plan — call agent_next_action and reconcile, or call agent_plan_advance after each completed step"
             )
 
-        # Task-scoped: most recent task steps are failures.
         if task_id:
             task = self.mem.task_get(task_id)
             if task.get("ok"):
@@ -890,7 +887,7 @@ class AgentCognition:
             "suggestions": suggestions or ["no stuck-pattern detected"],
         }
 
-    def replan(
+    async def replan(
         self,
         task_id: str,
         *,
@@ -898,10 +895,7 @@ class AgentCognition:
         new_steps: list[str] | None = None,
     ) -> dict:
         """
-        Replace the current plan with a new ordered list of steps. If
-        new_steps is None, returns a recommendation packet (the model
-        should propose new_steps and call again). The reason is logged
-        as a task step so the timeline shows why the plan changed.
+        Replace the current plan with a new ordered list of steps.
         """
         task = self.mem.task_get(task_id)
         if not task.get("ok"):
@@ -918,8 +912,7 @@ class AgentCognition:
                 "stuck_signals": self.stuck_detect(task_id=task_id)["signals"],
                 "hint": (
                     "Propose a new ordered list of concrete steps and call "
-                    "agent_replan again with new_steps populated. Each step "
-                    "should be one tool call or one short observable action."
+                    "agent_replan again with new_steps populated."
                 ),
             }
         cleaned = [
@@ -929,14 +922,17 @@ class AgentCognition:
         ][:PLAN_STEP_MAX]
         if not cleaned:
             return {"ok": False, "error": "new_steps must contain at least one step"}
-        plan_doc = {"steps": cleaned, "cursor": 0, "updated": time.time()}
-        self.mem.fact_set(f"plan:{task_id}", json.dumps(plan_doc, ensure_ascii=False))
-        self.mem.task_step(
-            task_id,
-            step=f"replan ({len(cleaned)} steps)",
-            ok=True,
-            detail=f"reason: {reason_clean}",
-        )
+
+        lock = await self._task_lock(task_id)
+        async with lock:
+            plan_doc = {"steps": cleaned, "cursor": 0, "updated": time.time()}
+            self.mem.fact_set(f"plan:{task_id}", json.dumps(plan_doc, ensure_ascii=False))
+            self.mem.task_step(
+                task_id,
+                step=f"replan ({len(cleaned)} steps)",
+                ok=True,
+                detail=f"reason: {reason_clean}",
+            )
         return {
             "ok": True,
             "task_id": task_id,
@@ -946,14 +942,7 @@ class AgentCognition:
 
     def recover(self, task_id: str) -> dict:
         """
-        Compose a recovery packet for a stalled or failing task. Read-only
-        — does not change the plan or task state. Surfaces:
-          - the goal and current step
-          - the latest failures (with their categories)
-          - lessons that match the failed tools
-          - a suggested 'next move' based on stuck signals
-        The model is expected to either ask the user, call agent_replan
-        with new_steps, or pick a different tool.
+        Compose a recovery packet for a stalled or failing task. Read-only.
         """
         task = self.mem.task_get(task_id)
         if not task.get("ok"):
