@@ -5,8 +5,24 @@ All functions are async-wrapped so the MCP server stays non-blocking.
 Special-char typing: pyautogui.write() silently drops chars like @, #, {, \n.
 For any string that contains non-alphanumeric chars we fall back to
 clipboard-paste (set via pyperclip then Ctrl+V) which handles all Unicode.
+
+FIX (Task 8): keyboard_type clipboard path now:
+  1. Saves the previous clipboard contents before overwriting.
+  2. Verifies the paste text was actually written to the clipboard before
+     firing Ctrl+V — if pyperclip.copy() silently failed (e.g. no clipboard
+     daemon on Linux), we catch the mismatch and raise instead of pasting
+     garbage or an empty string.
+  3. Restores the previous clipboard contents after the paste so the user's
+     prior clipboard data is not permanently destroyed.
+
+FIX (Task 9): keyboard_type, mouse_click, and mouse_double_click accept an
+optional confirm_screenshot=False parameter. When True, a screenshot is taken
+immediately after the action and returned in the response dict so the caller
+can verify the UI state without a separate screenshot round-trip.
 """
 import asyncio
+import base64
+import io
 import string
 import pyautogui
 
@@ -22,39 +38,78 @@ def _needs_clipboard(text: str) -> bool:
     return any(c not in _SAFE_CHARS for c in text) or "\n" in text or "\t" in text
 
 
+def _screenshot_b64() -> str | None:
+    """Capture a screenshot and return it as a base64-encoded PNG string."""
+    try:
+        import PIL.Image  # pyautogui ships with Pillow
+        img = pyautogui.screenshot()
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception as e:
+        return f"screenshot_failed: {e}"
+
+
 # ---------------------------------------------------------------------------
 # Mouse
 # ---------------------------------------------------------------------------
 
-async def mouse_move(x: int, y: int, duration: float = 0.15) -> str:
+async def mouse_move(x: int, y: int, duration: float = 0.15) -> dict:
     await asyncio.to_thread(pyautogui.moveTo, x, y, duration=duration)
-    return f"Mouse moved to ({x}, {y})"
+    return {"ok": True, "action": "mouse_move", "x": x, "y": y}
 
 
-async def mouse_click(x: int, y: int, button: str = "left", clicks: int = 1) -> str:
+async def mouse_click(
+    x: int,
+    y: int,
+    button: str = "left",
+    clicks: int = 1,
+    confirm_screenshot: bool = False,
+) -> dict:
     """
     Click at (x, y).
     button: 'left' | 'right' | 'middle'
     clicks: number of clicks (1 = single, 2 = double)
+    confirm_screenshot: if True, captures a screenshot after the click and
+        includes it as base64 PNG in the response under 'screenshot'.
     """
     await asyncio.to_thread(pyautogui.click, x, y, button=button, clicks=clicks, interval=0.08)
-    return f"{'Double-' if clicks == 2 else ''}Clicked ({x}, {y}) [{button}]"
+    result: dict = {
+        "ok": True,
+        "action": "mouse_click",
+        "x": x,
+        "y": y,
+        "button": button,
+        "clicks": clicks,
+    }
+    if confirm_screenshot:
+        await asyncio.sleep(0.15)  # let UI settle before capture
+        result["screenshot"] = await asyncio.to_thread(_screenshot_b64)
+    return result
 
 
-async def mouse_double_click(x: int, y: int) -> str:
+async def mouse_double_click(
+    x: int,
+    y: int,
+    confirm_screenshot: bool = False,
+) -> dict:
     await asyncio.to_thread(pyautogui.doubleClick, x, y)
-    return f"Double-clicked ({x}, {y})"
+    result: dict = {"ok": True, "action": "mouse_double_click", "x": x, "y": y}
+    if confirm_screenshot:
+        await asyncio.sleep(0.15)
+        result["screenshot"] = await asyncio.to_thread(_screenshot_b64)
+    return result
 
 
-async def mouse_right_click(x: int, y: int) -> str:
+async def mouse_right_click(x: int, y: int) -> dict:
     await asyncio.to_thread(pyautogui.rightClick, x, y)
-    return f"Right-clicked ({x}, {y})"
+    return {"ok": True, "action": "mouse_right_click", "x": x, "y": y}
 
 
-async def mouse_scroll(x: int, y: int, clicks: int) -> str:
+async def mouse_scroll(x: int, y: int, clicks: int) -> dict:
     await asyncio.to_thread(pyautogui.moveTo, x, y, duration=0.1)
     await asyncio.to_thread(pyautogui.scroll, clicks)
-    return f"Scrolled {clicks} clicks at ({x}, {y})"
+    return {"ok": True, "action": "mouse_scroll", "x": x, "y": y, "clicks": clicks}
 
 
 async def mouse_drag(
@@ -62,64 +117,125 @@ async def mouse_drag(
     x2: int, y2: int,
     duration: float = 0.4,
     button: str = "left",
-) -> str:
+) -> dict:
     """
     Click-drag from (x1,y1) to (x2,y2).
     Useful for window repositioning, selecting text, slider controls, drag-and-drop.
     button: 'left' | 'right' | 'middle'
-
-    FIX: old version called pyautogui.drag() (relative, from current pos) THEN
-    moveTo+dragTo, causing every drag to fire twice from the wrong start point.
-    Now uses only dragTo with an explicit moveTo first.
     """
-    # Step 1: Move to start position without clicking
     await asyncio.to_thread(pyautogui.moveTo, x1, y1, duration=0.15)
-    # Step 2: Drag from current position (x1,y1) to (x2,y2)
     await asyncio.to_thread(pyautogui.dragTo, x2, y2, duration=duration, button=button)
-    return f"Dragged [{button}] ({x1},{y1}) -> ({x2},{y2})"
+    return {"ok": True, "action": "mouse_drag", "from": [x1, y1], "to": [x2, y2], "button": button}
 
 
 # ---------------------------------------------------------------------------
 # Keyboard
 # ---------------------------------------------------------------------------
 
-async def keyboard_type(text: str, interval: float = 0.02) -> str:
+def _clipboard_type_sync(text: str) -> dict:
+    """
+    FIX (Task 8): Safe clipboard-paste path.
+    1. Saves existing clipboard content before overwriting.
+    2. Verifies pyperclip.copy() actually wrote the correct text.
+    3. Fires Ctrl+V to paste.
+    4. Restores the original clipboard content afterward.
+    Returns a dict with ok, method, and an optional error key.
+    """
+    import pyperclip
+    # Step 1 — save current clipboard so we can restore it
+    try:
+        previous = pyperclip.paste()
+    except Exception:
+        previous = ""  # clipboard was empty or unreadable; safe to treat as blank
+
+    # Step 2 — write our text to the clipboard
+    pyperclip.copy(text)
+
+    # Step 3 — verify the write actually took (catches silent failures)
+    actual = pyperclip.paste()
+    if actual != text:
+        # Restore before raising so we don't leave garbage on the clipboard
+        try:
+            pyperclip.copy(previous)
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"pyperclip.copy() verification failed: "
+            f"expected {len(text)} chars, got {len(actual)} chars. "
+            "This usually means no clipboard daemon is running (e.g. xclip/xsel missing on Linux)."
+        )
+
+    # Step 4 — paste
+    pyautogui.hotkey("ctrl", "v")
+
+    # Step 5 — restore previous clipboard content
+    try:
+        pyperclip.copy(previous)
+    except Exception:
+        pass  # best-effort restore; don't fail the whole type operation over this
+
+    return {"ok": True, "method": "clipboard"}
+
+
+async def keyboard_type(
+    text: str,
+    interval: float = 0.02,
+    confirm_screenshot: bool = False,
+) -> dict:
     """
     Type a string. Uses clipboard-paste fallback for special chars (\n, @, #, etc.)
     interval: seconds between keystrokes (only used in direct-write path)
+    confirm_screenshot: if True, captures a screenshot after typing and
+        includes it as base64 PNG in the response under 'screenshot'.
     """
+    label = f"{text[:60]}{'...' if len(text) > 60 else ''}"
+    result: dict = {"ok": True, "action": "keyboard_type", "text_preview": label}
+
     if _needs_clipboard(text):
         try:
-            import pyperclip
-            await asyncio.to_thread(pyperclip.copy, text)
-            await asyncio.to_thread(pyautogui.hotkey, "ctrl", "v")
-            return f"Typed via clipboard ({len(text)} chars): {text[:60]}{'...' if len(text)>60 else ''}"
+            import pyperclip  # noqa: F401 — check availability before thread
+            clip_result = await asyncio.to_thread(_clipboard_type_sync, text)
+            result["method"] = clip_result["method"]
         except ImportError:
-            pass  # pyperclip not installed, fall through to direct write
-    await asyncio.to_thread(pyautogui.write, text, interval=interval)
-    return f"Typed: {text[:60]}{'...' if len(text)>60 else ''}"
+            # pyperclip not installed — fall through to direct write
+            await asyncio.to_thread(pyautogui.write, text, interval=interval)
+            result["method"] = "direct_write_fallback"
+            result["warning"] = "pyperclip not installed; special characters may be dropped."
+        except RuntimeError as e:
+            result["ok"] = False
+            result["error"] = str(e)
+            return result
+    else:
+        await asyncio.to_thread(pyautogui.write, text, interval=interval)
+        result["method"] = "direct_write"
+
+    if confirm_screenshot:
+        await asyncio.sleep(0.15)
+        result["screenshot"] = await asyncio.to_thread(_screenshot_b64)
+
+    return result
 
 
-async def keyboard_hotkey(keys: str) -> str:
+async def keyboard_hotkey(keys: str) -> dict:
     """Press a keyboard shortcut. Examples: 'ctrl+c', 'alt+f4', 'ctrl+shift+esc', 'win+d'."""
     parts = [k.strip() for k in keys.split("+")]
     await asyncio.to_thread(pyautogui.hotkey, *parts)
-    return f"Hotkey: {keys}"
+    return {"ok": True, "action": "keyboard_hotkey", "keys": keys}
 
 
-async def keyboard_press(key: str, presses: int = 1) -> str:
+async def keyboard_press(key: str, presses: int = 1) -> dict:
     """Press a single key one or more times. key examples: 'enter', 'escape', 'tab', 'f5', 'delete'."""
     await asyncio.to_thread(pyautogui.press, key, presses=presses, interval=0.05)
-    return f"Key '{key}' x{presses}"
+    return {"ok": True, "action": "keyboard_press", "key": key, "presses": presses}
 
 
-async def keyboard_key_down(key: str) -> str:
+async def keyboard_key_down(key: str) -> dict:
     """Hold a key down (without releasing). Pair with keyboard_key_up."""
     await asyncio.to_thread(pyautogui.keyDown, key)
-    return f"Key down: {key}"
+    return {"ok": True, "action": "keyboard_key_down", "key": key}
 
 
-async def keyboard_key_up(key: str) -> str:
+async def keyboard_key_up(key: str) -> dict:
     """Release a held key."""
     await asyncio.to_thread(pyautogui.keyUp, key)
-    return f"Key up: {key}"
+    return {"ok": True, "action": "keyboard_key_up", "key": key}
