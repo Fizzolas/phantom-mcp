@@ -5,18 +5,15 @@ Agent-owned files bypass this entirely.
 Now tracks ownership in data/agent_files.json (separate from memory.json).
 
 FIX (Task 10): _show_auth_dialog previously swallowed all tkinter exceptions
-with a bare `except Exception: return False`. This caused silent denials with
-no indication of *why* — a headless server, a missing DISPLAY env var, or a
-broken tkinter install all produced the same silent False, making it impossible
-to distinguish a real user denial from an infrastructure failure.
+with a bare `except Exception: return False`. Exceptions are now logged;
+_show_auth_dialog returns a named tuple; requires_auth distinguishes between
+a real user denial and an infrastructure failure.
 
-Now:
-  - Exceptions are caught and logged to stderr via the standard `logging` module.
-  - _show_auth_dialog returns a named tuple / dict so callers can tell the
-    difference between 'user said no' and 'dialog could not be shown'.
-  - requires_auth raises a descriptive RuntimeError (not PermissionError) when
-    the dialog itself failed, so the agent knows to investigate the environment
-    rather than assuming the user denied the request.
+FIX (Bug 7): _save_registry() previously had no exception handler. If the
+write failed (disk full, permissions denied, path not writable), an unhandled
+OSError propagated all the way up through requires_auth as a confusing crash.
+Now wrapped with log.error() and a clean return, so a failed write is always
+visible in logs but never crashes the auth flow.
 """
 import asyncio
 import json
@@ -48,12 +45,32 @@ def _load_registry() -> set:
     return set()
 
 
-def _save_registry(paths: set):
-    _REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _REGISTRY_PATH.write_text(
-        json.dumps(sorted(paths), indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+def _save_registry(paths: set) -> bool:
+    """
+    Persist the agent file registry to disk.
+
+    BUG 7 FIX: Wrapped the write in try/except. Previously any OSError
+    (disk full, permission denied, path not writable) propagated unhandled
+    all the way up through requires_auth, producing a confusing crash that
+    looked like an auth failure rather than a disk/permission problem.
+    Now logs the error clearly and returns False so callers can detect it.
+    Returns True on success, False on failure.
+    """
+    try:
+        _REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _REGISTRY_PATH.write_text(
+            json.dumps(sorted(paths), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return True
+    except OSError as e:
+        log.error(
+            "auth_guard: failed to save agent file registry to '%s': %s — "
+            "registry changes will not persist across restarts.",
+            _REGISTRY_PATH,
+            e,
+        )
+        return False
 
 
 def register_agent_file(path: str):
@@ -71,15 +88,13 @@ def _is_agent_file(path: str) -> bool:
 async def requires_auth(func, path: str, *args):
     """
     Wrap a file operation with ownership check.
-    - Path doesn't exist yet  -> agent creating it; register and proceed.
-    - Agent-owned path        -> proceed immediately.
-    - User-owned path         -> show approval dialog.
+    - Path doesn't exist yet  → agent creating it; register and proceed.
+    - Agent-owned path        → proceed immediately.
+    - User-owned path         → show approval dialog.
 
     Raises:
         PermissionError  — user explicitly denied the request.
         RuntimeError     — dialog could not be shown (tkinter/headless failure).
-                           Distinct from PermissionError so the caller knows
-                           this is an infrastructure problem, not a user decision.
     """
     p = Path(path)
     if not p.exists():
@@ -93,9 +108,6 @@ async def requires_auth(func, path: str, *args):
     auth = await asyncio.to_thread(_show_auth_dialog, path, func.__name__)
 
     if not auth.dialog_shown:
-        # FIX (Task 10): tkinter failed before the user could respond.
-        # Raise RuntimeError (not PermissionError) so the agent knows this is
-        # an environment problem and not a deliberate denial by the user.
         raise RuntimeError(
             f"auth_guard: could not show approval dialog for '{path}'. "
             f"Reason: {auth.denial_reason}. "
@@ -113,9 +125,8 @@ async def requires_auth(func, path: str, *args):
 
 def _show_auth_dialog(path: str, action: str) -> _AuthResult:
     """
-    FIX (Task 10): Returns _AuthResult instead of bare bool.
-    Logs the specific exception before falling back to deny, so the server
-    log always shows *why* a dialog failed rather than silently returning False.
+    Returns _AuthResult instead of bare bool.
+    Logs the specific exception before falling back to deny.
     """
     try:
         root = tk.Tk()
@@ -137,12 +148,10 @@ def _show_auth_dialog(path: str, action: str) -> _AuthResult:
             denial_reason="" if user_approved else "User clicked No.",
         )
     except tk.TclError as e:
-        # Most common cause: no DISPLAY on a headless server, or Tcl/Tk not installed.
         msg = f"tkinter TclError (likely headless/no display): {e}"
         log.error("auth_guard: %s", msg)
         return _AuthResult(approved=False, dialog_shown=False, denial_reason=msg)
     except Exception as e:
-        # Catch-all for unexpected tkinter failures.
         msg = f"{type(e).__name__}: {e}"
         log.error("auth_guard: unexpected dialog failure — %s", msg)
         return _AuthResult(approved=False, dialog_shown=False, denial_reason=msg)
