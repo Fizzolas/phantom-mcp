@@ -14,14 +14,14 @@ returns available_titles so the model can retry with the correct name without
 an extra list_windows round-trip.
 
 FIX (Task 5): _hWnd is now re-validated with win32gui.IsWindow() before use.
-A cached handle can go stale if the window was closed and re-opened between
-calls — the old handle still exists in memory but points to a destroyed window.
-We now always re-query via win32gui.FindWindow as the authoritative source and
-only fall back to _hWnd if FindWindow returns nothing.
 
-FIX (Task 6): All functions that previously returned bare strings on failure
-now return dicts with consistent keys (ok, error/message, title) so every
-caller can reliably check success with result.get("ok") or "error" in result.
+FIX (Task 6): All functions return dicts with consistent ok/error keys.
+
+FIX (Bug 4): list_windows() now wraps the gw.getAllWindows() call itself in a
+try/except. Previously only individual window property reads were protected.
+If getAllWindows() threw (display server restart, pygetwindow internal error),
+the whole tool crashed with an unhandled exception. Now returns a clean error
+dict so the agent can handle the failure gracefully.
 """
 import asyncio
 import ctypes
@@ -52,26 +52,17 @@ def _find(title: str):
 
 def _resolve_hwnd(w) -> int | None:
     """
-    FIX (Task 5): Safely resolve a live, valid HWND for window `w`.
-
-    pygetwindow caches _hWnd at object-creation time. If a window is closed
-    and re-opened (e.g. a browser tab that restarts), _hWnd points to a
-    destroyed window handle — IsWindow() returns False and any win32 call
-    on it silently fails or raises.
-
+    Safely resolve a live, valid HWND for window `w`.
     Resolution order:
-      1. Try win32gui.FindWindow(None, w.title) — always authoritative.
-      2. Fall back to w._hWnd only if FindWindow returns nothing AND the
-         cached handle still passes IsWindow().
-      3. Return None if no valid handle found.
+      1. win32gui.FindWindow(None, w.title) — always authoritative.
+      2. Cached _hWnd only if FindWindow returns nothing AND IsWindow() passes.
+      3. None if no valid handle found.
     """
     if not HAS_WIN32:
         return None
-    # Prefer a fresh lookup by title
     hwnd = win32gui.FindWindow(None, w.title)
     if hwnd and win32gui.IsWindow(hwnd):
         return hwnd
-    # Fallback: cached handle, only if still valid
     cached = getattr(w, "_hWnd", None)
     if cached and win32gui.IsWindow(cached):
         return cached
@@ -80,10 +71,7 @@ def _resolve_hwnd(w) -> int | None:
 
 def _force_foreground(hwnd: int) -> bool:
     """
-    FIX: Force a window to the foreground on Windows 10/11.
-    Standard SetForegroundWindow is silently ignored when called from a background
-    process — the window just flashes in the taskbar. Attaching the calling thread's
-    input queue to the target window's thread bypasses this restriction.
+    Force a window to the foreground on Windows 10/11 via AttachThreadInput.
     """
     if not HAS_WIN32:
         return False
@@ -119,9 +107,18 @@ async def list_windows() -> list:
     """List all visible window titles with their position and size."""
     if not HAS_GW:
         return [_no_gw()]
+
     def _get():
+        # BUG 4 FIX: wrap getAllWindows() itself in a try/except.
+        # Previously only individual property reads were protected; if
+        # getAllWindows() threw the whole function crashed unhandled.
+        try:
+            all_wins = gw.getAllWindows()
+        except Exception as e:
+            return [{"ok": False, "error": f"getAllWindows() failed: {e}"}]
+
         results = []
-        for w in gw.getAllWindows():
+        for w in all_wins:
             if not w.title.strip():
                 continue
             try:
@@ -137,6 +134,7 @@ async def list_windows() -> list:
             except Exception:
                 results.append({"title": w.title})
         return results
+
     return await asyncio.to_thread(_get)
 
 
@@ -145,9 +143,6 @@ async def focus_window(title: str, strict: bool = False) -> dict:
     Bring a window to the foreground.
     strict=True  → only exact title matches accepted.
     strict=False → case-insensitive substring match (default).
-    Returns a dict so callers can detect failure and see available_titles.
-    FIX (Task 5): Uses _resolve_hwnd() instead of raw _hWnd to guarantee the
-    handle is live before passing it to win32 calls.
     """
     if not HAS_GW:
         return {"ok": False, "error": "pygetwindow not available. Run: pip install pygetwindow"}
@@ -171,7 +166,6 @@ async def focus_window(title: str, strict: bool = False) -> dict:
             await asyncio.sleep(0.2)
 
         if HAS_WIN32:
-            # FIX (Task 5): _resolve_hwnd() re-validates the handle before use
             hwnd = _resolve_hwnd(w)
             if hwnd and _force_foreground(hwnd):
                 await asyncio.sleep(0.1)
@@ -209,7 +203,6 @@ def get_active_window() -> dict:
 
 
 async def minimize_window(title: str) -> dict:
-    # FIX (Task 6): was returning bare str; now returns dict for consistent error handling
     if not HAS_GW:
         return _no_gw()
     matches = _find(title)
@@ -223,7 +216,6 @@ async def minimize_window(title: str) -> dict:
 
 
 async def maximize_window(title: str) -> dict:
-    # FIX (Task 6): was returning bare str; now returns dict for consistent error handling
     if not HAS_GW:
         return _no_gw()
     matches = _find(title)
@@ -238,7 +230,6 @@ async def maximize_window(title: str) -> dict:
 
 async def restore_window(title: str) -> dict:
     """Restore a minimized/maximized window to its normal size."""
-    # FIX (Task 6): was returning bare str; now returns dict for consistent error handling
     if not HAS_GW:
         return _no_gw()
     matches = _find(title)
@@ -278,7 +269,6 @@ async def get_window_rect(title: str) -> dict:
 
 async def resize_window(title: str, width: int, height: int) -> dict:
     """Resize a window to the given width and height in pixels."""
-    # FIX (Task 6): was returning bare str; now returns dict for consistent error handling
     if not HAS_GW:
         return _no_gw()
     matches = _find(title)
@@ -293,7 +283,6 @@ async def resize_window(title: str, width: int, height: int) -> dict:
 
 async def move_window(title: str, x: int, y: int) -> dict:
     """Move a window's top-left corner to (x, y)."""
-    # FIX (Task 6): was returning bare str; now returns dict for consistent error handling
     if not HAS_GW:
         return _no_gw()
     matches = _find(title)
