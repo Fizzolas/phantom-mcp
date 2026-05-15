@@ -38,6 +38,19 @@ Pass 4 notes:
   Issue 1 — all write methods are now `async def` and acquire self._lock.
   Issue 2 — compact() uses atomic tmp→rename for traces.jsonl rewrite.
   Issue 3 — _read_json() logs + renames corrupt files before returning default.
+
+Pass 5 notes:
+  Issue 1 — compact() now writes traces FIRST (atomically), THEN records
+             the summary fact, preventing a crash from leaving a dangling
+             trace_summary key that points to un-trimmed traces.
+  Issue 2 — _ask_lms_for_lesson() now accepts model_id parameter; callers
+             pass the real LM Studio model ID instead of "local-model".
+             learn_from_traces() logs a warning when the LMS call fails
+             rather than silently swallowing the exception.
+  Issue 6 — trace_recent() uses a tail-style file reader (_read_traces_tail)
+             to avoid loading the entire traces.jsonl into RAM on every call.
+             trace_failures() and learn_from_traces() still do a full read
+             (they need the whole window), but recent() is now O(tail-size).
 """
 from __future__ import annotations
 
@@ -263,7 +276,11 @@ class PhantomMemory:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     def trace_recent(self, limit: int = 20, tool: str | None = None) -> list[dict]:
-        traces = list(self._read_traces())
+        # Pass 5 Issue 6: use tail-style read to avoid loading the full file.
+        # If a tool filter is applied we need more lines to get enough matches,
+        # so over-fetch by 4x and let the filter reduce it.
+        fetch = limit * 4 if tool else limit
+        traces = self._read_traces_tail(fetch)
         if tool:
             traces = [t for t in traces if t.get("tool") == tool]
         return traces[-limit:]
@@ -285,6 +302,39 @@ class PhantomMemory:
             except Exception:
                 continue
         return out
+
+    def _read_traces_tail(self, n: int) -> list[dict]:
+        """
+        Pass 5 Issue 6: read only the last ~n records from traces.jsonl
+        by seeking to the end of the file rather than loading the whole
+        thing into RAM. Uses a heuristic chunk size (n * 512 bytes) that
+        comfortably covers typical trace line lengths; falls back to the
+        full file if the file is smaller than the chunk.
+        """
+        p = self.dir / "traces.jsonl"
+        if not p.exists():
+            return []
+        try:
+            with p.open("rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                chunk = min(size, n * 512)
+                f.seek(-chunk, 2)
+                raw = f.read().decode("utf-8", errors="replace")
+        except Exception:
+            # Fallback: full read if seek fails (e.g., non-seekable fs).
+            raw = p.read_text(encoding="utf-8", errors="replace")
+        lines = raw.splitlines()
+        result = []
+        for line in lines[-n:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                result.append(json.loads(line))
+            except Exception:
+                continue
+        return result
 
     # ------------------------------------------------------------------
     # LESSONS (distilled action knowledge)
@@ -386,11 +436,16 @@ class PhantomMemory:
         window: int = 200,
         *,
         lms_base: str | None = None,
+        lms_base_model_id: str | None = None,
     ) -> dict:
         """
         Look at recent traces; record one or more lessons for tools that
         repeatedly fail. Heuristic-only by default; if `lms_base` is given,
         try to ask LM Studio for a free-form summary.
+
+        Pass 5 Issue 2: lms_base_model_id is forwarded to _ask_lms_for_lesson
+        so it uses the real loaded model ID rather than "local-model". If the
+        LMS call fails, a warning is logged instead of silently swallowing.
         """
         all_traces = list(self._read_traces())
         recent = all_traces[-window:]
@@ -422,9 +477,21 @@ class PhantomMemory:
 
             if lms_base:
                 try:
-                    body = await _ask_lms_for_lesson(lms_base, tool_name, fails, success_count)
-                except Exception:
-                    pass  # fall back to heuristic body
+                    body = await _ask_lms_for_lesson(
+                        lms_base,
+                        tool_name,
+                        fails,
+                        success_count,
+                        model_id=lms_base_model_id or "local-model",
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "LM Studio lesson generation failed for tool %r "
+                        "(model_id=%r): %s — using heuristic body instead.",
+                        tool_name,
+                        lms_base_model_id,
+                        exc,
+                    )
 
             await self.lesson_set(f"auto:{tool_name}", body, source="auto")
             learned.append(tool_name)
@@ -444,6 +511,14 @@ class PhantomMemory:
 
         Pass 4 Issue 2: traces.jsonl is rewritten atomically via a
         .jsonl.tmp file renamed into place, matching _write_json's pattern.
+
+        Pass 5 Issue 1: write order is now TRACES FIRST, SUMMARY SECOND.
+        If the server crashes between the two writes, the trace file is
+        already trimmed and the summary fact is simply missing — which is
+        recoverable. The previous order (summary first, then trim) could
+        leave a dangling summary key pointing to un-trimmed traces, causing
+        compaction to believe it had already run and the trace log to grow
+        forever on restart.
         """
         traces = list(self._read_traces())
         if len(traces) <= self.config.trace_keep_after_compact:
@@ -465,9 +540,9 @@ class PhantomMemory:
             "per_tool": per_tool,
         }
         ts = int(time.time())
-        # Write summary fact first (already atomic via _write_json inside fact_set).
-        await self.fact_set(f"trace_summary:{ts}", json.dumps(summary, ensure_ascii=False))
-        # Atomically rewrite traces.jsonl via a tmp file.
+
+        # Pass 5 Issue 1: STEP 1 — atomically rewrite traces.jsonl FIRST.
+        # A crash here leaves the old traces intact and no summary fact written.
         p = self.dir / "traces.jsonl"
         tmp = p.with_suffix(".jsonl.tmp")
         async with self._lock:
@@ -476,6 +551,13 @@ class PhantomMemory:
                 encoding="utf-8",
             )
             tmp.replace(p)
+
+        # Pass 5 Issue 1: STEP 2 — only AFTER the trace rewrite succeeds,
+        # record the summary fact. A crash here loses the summary key, but
+        # the traces are already trimmed, so the next compact() will just
+        # redo the summary with the next batch.
+        await self.fact_set(f"trace_summary:{ts}", json.dumps(summary, ensure_ascii=False))
+
         return {"ok": True, "trimmed": True, "kept": len(kept), "summary_key": f"trace_summary:{ts}"}
 
 
@@ -503,7 +585,20 @@ def _safe_filename(label: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", label)[:120] or "_unnamed"
 
 
-async def _ask_lms_for_lesson(base: str, tool: str, fails: list[dict], successes: int) -> str:
+async def _ask_lms_for_lesson(
+    base: str,
+    tool: str,
+    fails: list[dict],
+    successes: int,
+    *,
+    model_id: str = "local-model",
+) -> str:
+    """
+    Pass 5 Issue 2: model_id is now a proper parameter instead of being
+    hardcoded to "local-model". Callers should pass the real loaded model
+    identifier obtained from the LM Studio probe so that the /chat/completions
+    request is correctly routed by LM Studio's REST API.
+    """
     import httpx
 
     sample = "\n".join(
@@ -520,11 +615,12 @@ async def _ask_lms_for_lesson(base: str, tool: str, fails: list[dict], successes
         resp = await client.post(
             f"{base}/chat/completions",
             json={
-                "model": "local-model",
+                "model": model_id,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 220,
                 "temperature": 0.2,
             },
         )
+        resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"].strip()
