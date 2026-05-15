@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import io
-import sys
 import textwrap
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
@@ -38,8 +37,31 @@ def _truncate(text: str, cap: int = MAX_OUTPUT) -> str:
 # =========================================================
 # One-shot CMD
 # =========================================================
-async def run_cmd(command: str, timeout: int = 30) -> dict:
+async def run_cmd(command: str, timeout: int = 30, allow_shell: bool = False) -> dict:
+    """
+    Run a one-shot CMD command.
+
+    FIX (Task 4): shell=True is a known command-injection risk. It is now
+    gated behind allow_shell=True so the caller must consciously opt in.
+
+    allow_shell=False (default):
+        Returns an error dict explaining the risk. The agent must explicitly
+        pass allow_shell=True to proceed.
+    allow_shell=True:
+        Executes with shell=True and stamps a 'shell_warning' key in the
+        response so logs always show when this unsafe path was taken.
+    """
     loop = asyncio.get_event_loop()
+    if not allow_shell:
+        return {
+            "error": (
+                "run_cmd requires allow_shell=True to execute. "
+                "shell=True enables command injection if the input is not "
+                "fully controlled. Pass allow_shell=True only when the command "
+                "string is constructed entirely by the agent, not from user input."
+            ),
+            "returncode": -1,
+        }
     return await loop.run_in_executor(None, _run_cmd_sync, command, timeout)
 
 
@@ -48,7 +70,7 @@ def _run_cmd_sync(command: str, timeout: int) -> dict:
     try:
         result = subprocess.run(
             command,
-            shell=True,
+            shell=True,  # noqa: S602 — caller acknowledged via allow_shell=True
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -59,6 +81,7 @@ def _run_cmd_sync(command: str, timeout: int) -> dict:
             "stdout": _truncate(result.stdout),
             "stderr": _truncate(result.stderr),
             "returncode": result.returncode,
+            "shell_warning": "shell=True used — command injection risk acknowledged by caller.",
         }
     except subprocess.TimeoutExpired:
         return {"error": f"Command timed out after {timeout}s", "returncode": -1}
