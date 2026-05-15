@@ -18,6 +18,14 @@ short TTL so we don't hammer LM Studio every time list_tools is called.
 If LM Studio is unreachable, the probe returns a degraded-but-valid
 snapshot — the server keeps working, tools that don't need the model
 (shell, file ops, clipboard) stay available.
+
+Pass 5 Issue 4:
+  _probe_via_sdk() now queries the model object for actual tool-use
+  capability instead of unconditionally returning supports_tools=True.
+  It checks model.supports_tool_use first, then model.capabilities["tools"]
+  as a fallback, and defaults to False when neither attribute is present.
+  This prevents tool calls from being dispatched to models (e.g. base
+  models, old GGUFs) that silently ignore or mangle tool-call messages.
 """
 from __future__ import annotations
 
@@ -102,6 +110,28 @@ async def _probe_once(base_url: str) -> LMStudioProbe:
     return rest_probe
 
 
+def _sdk_model_supports_tools(model: Any) -> bool:
+    """
+    Pass 5 Issue 4: inspect the SDK model object for actual tool-use
+    capability rather than assuming True.
+
+    Priority order:
+      1. model.supports_tool_use  (direct bool attribute, some SDK versions)
+      2. model.capabilities["tools"]  (dict attribute, other SDK versions)
+      3. False  (conservative default — let the REST probe confirm if needed)
+    """
+    # Direct attribute (e.g. future SDK versions).
+    val = getattr(model, "supports_tool_use", None)
+    if val is not None:
+        return bool(val)
+    # Dict-style capabilities (e.g. SDK versions that expose .capabilities).
+    caps = getattr(model, "capabilities", None)
+    if isinstance(caps, dict):
+        return bool(caps.get("tools", False))
+    # Unknown SDK shape — default to False; REST probe will set it correctly.
+    return False
+
+
 async def _probe_via_sdk() -> LMStudioProbe | None:
     """
     Preferred path: LM Studio's official Python SDK. Surfaces exact context
@@ -113,6 +143,9 @@ async def _probe_via_sdk() -> LMStudioProbe | None:
     'This event loop is already running' when called from a thread
     spawned by the already-running loop. Fall back to REST on any error,
     including SDK versions that don't expose AsyncClient yet.
+
+    Pass 5 Issue 4: supports_tools is now derived from _sdk_model_supports_tools()
+    instead of being hardcoded to True.
     """
     try:
         import lmstudio  # type: ignore
@@ -131,12 +164,14 @@ async def _probe_via_sdk() -> LMStudioProbe | None:
                     or getattr(model, "id", None)
                     or "unknown"
                 )
+                # Pass 5 Issue 4: query actual capability, don't assume True.
+                has_tools = _sdk_model_supports_tools(model)
                 return LMStudioProbe(
                     reachable=True,
                     model_id=str(mid),
                     context_length=ctx,
-                    supports_tools=True,
-                    raw={"via": "sdk_async"},
+                    supports_tools=has_tools,
+                    raw={"via": "sdk_async", "supports_tools_raw": has_tools},
                 )
     except Exception as e:
         return LMStudioProbe(
