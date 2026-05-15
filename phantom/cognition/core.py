@@ -25,6 +25,16 @@ Concurrency note (Pass 3 Issue 4):
   lock-free. The lock dict itself (_task_locks) is guarded by a small
   meta-lock (_locks_lock) so concurrent first-access for the same
   task_id never races on lock creation.
+
+Pass 5 notes:
+  Issue 3 — after_action_review() now deletes the checkpoint fact AFTER
+             lesson_set() succeeds. If lesson_set raises (e.g. disk full),
+             the checkpoint is preserved so the AAR can be retried without
+             losing either the checkpoint or the lesson.
+  Issue 5 — stuck_detect() failure-threshold check now requires BOTH a
+             minimum count (STUCK_FAILURE_THRESHOLD) AND a minimum ratio
+             (>=50%) so that a handful of failures in a healthy run does
+             not falsely trigger stuck recovery.
 """
 from __future__ import annotations
 
@@ -62,7 +72,8 @@ CONFIDENCE_BANDS = (
 
 # Stuck-detector heuristics
 STUCK_RECENT_WINDOW = 8         # how many trailing traces to inspect
-STUCK_FAILURE_THRESHOLD = 3     # >=N failures inside the window = stuck
+STUCK_FAILURE_THRESHOLD = 3     # >=N failures inside the window = potential stuck
+STUCK_FAILURE_RATIO = 0.5       # Pass 5 Issue 5: also require >=50% failure rate
 STUCK_REPEAT_THRESHOLD = 3      # same tool+similar args N times in a row
 
 # Tool-name patterns that suggest an irreversible or high-impact action.
@@ -496,6 +507,11 @@ class AgentCognition:
         Compare expected vs observed for a previous checkpoint. On
         repeated success of the same intent pattern, optionally promote
         a short lesson the model can read on future calls.
+
+        Pass 5 Issue 3: the checkpoint fact is now deleted AFTER lesson_set
+        succeeds. If lesson_set raises (e.g. disk full), the checkpoint is
+        preserved so the AAR can be retried without losing either the
+        checkpoint or the lesson.
         """
         f = self.mem.fact_get(checkpoint_id)
         if not f.get("ok"):
@@ -536,11 +552,15 @@ class AgentCognition:
                         f"When intent is '{intent[:120]}', expecting '{expected[:120]}' "
                         f"reliably worked. Reuse this approach instead of exploring."
                     )
-                    self.mem.lesson_set(lesson_name, lesson_body, source="auto-aar")
+                    # Pass 5 Issue 3: lesson_set FIRST — if it raises, we fall
+                    # through without deleting the checkpoint, preserving both.
+                    await self.mem.lesson_set(lesson_name, lesson_body, source="auto-aar")
                     promoted = lesson_name
 
-            # Cleanup: keep facts space tight by deleting checkpoints once reviewed.
-            self.mem.fact_delete(checkpoint_id)
+            # Pass 5 Issue 3: delete the checkpoint ONLY after all writes above
+            # have succeeded. A crash or disk error in lesson_set will leave the
+            # checkpoint intact so the AAR can be retried.
+            await self.mem.fact_delete(checkpoint_id)
 
         return {
             "ok": True,
@@ -830,6 +850,11 @@ class AgentCognition:
     def stuck_detect(self, task_id: str | None = None) -> dict:
         """
         Detect repeated failures or thrashing and recommend a recovery path.
+
+        Pass 5 Issue 5: the failure-count check now also requires a minimum
+        failure *ratio* (STUCK_FAILURE_RATIO = 0.5). Three failures out of
+        eight traces is only 37.5% — not necessarily stuck. Both conditions
+        must be true to emit the failure signal.
         """
         traces = self.mem.trace_recent(limit=STUCK_RECENT_WINDOW)
         signals: list[str] = []
@@ -845,8 +870,13 @@ class AgentCognition:
             }
 
         fails = [t for t in traces if not t.get("ok")]
-        if len(fails) >= STUCK_FAILURE_THRESHOLD:
-            signals.append(f"{len(fails)}/{len(traces)} recent calls failed")
+        failure_ratio = len(fails) / len(traces)
+        # Pass 5 Issue 5: require BOTH minimum count AND minimum ratio.
+        if len(fails) >= STUCK_FAILURE_THRESHOLD and failure_ratio >= STUCK_FAILURE_RATIO:
+            signals.append(
+                f"{len(fails)}/{len(traces)} recent calls failed "
+                f"({failure_ratio:.0%} failure rate)"
+            )
             suggestions.append("stop retrying — call agent_replan or ask the user for guidance")
 
         tool_streak = 1
@@ -873,7 +903,7 @@ class AgentCognition:
             if task.get("ok"):
                 recent_steps = (task.get("steps") or [])[-STUCK_RECENT_WINDOW:]
                 bad = [s for s in recent_steps if not s.get("ok")]
-                if len(bad) >= STUCK_FAILURE_THRESHOLD:
+                if len(bad) >= STUCK_FAILURE_THRESHOLD and len(bad) / max(1, len(recent_steps)) >= STUCK_FAILURE_RATIO:
                     signals.append(
                         f"task '{task_id}' has {len(bad)} failed steps in its last "
                         f"{len(recent_steps)} entries"
