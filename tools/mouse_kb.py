@@ -9,16 +9,24 @@ clipboard-paste (set via pyperclip then Ctrl+V) which handles all Unicode.
 FIX (Task 8): keyboard_type clipboard path now:
   1. Saves the previous clipboard contents before overwriting.
   2. Verifies the paste text was actually written to the clipboard before
-     firing Ctrl+V — if pyperclip.copy() silently failed (e.g. no clipboard
-     daemon on Linux), we catch the mismatch and raise instead of pasting
-     garbage or an empty string.
-  3. Restores the previous clipboard contents after the paste so the user's
-     prior clipboard data is not permanently destroyed.
+     firing Ctrl+V — if pyperclip.copy() silently failed, we catch the mismatch
+     and raise instead of pasting garbage or an empty string.
+  3. Restores the previous clipboard contents after the paste.
 
 FIX (Task 9): keyboard_type, mouse_click, and mouse_double_click accept an
 optional confirm_screenshot=False parameter. When True, a screenshot is taken
-immediately after the action and returned in the response dict so the caller
-can verify the UI state without a separate screenshot round-trip.
+immediately after the action and returned in the response dict.
+
+FIX (Bug 5): Removed dead `import PIL.Image` from _screenshot_b64().
+  pyautogui.screenshot() returns a PIL Image internally without needing this
+  explicit import. On machines where PIL is only importable as `Pillow` (not
+  `PIL`), this line raised ImportError and broke every confirm_screenshot call.
+
+FIX (Bug 6): mouse_scroll now passes x and y directly to pyautogui.scroll()
+  instead of calling moveTo first then scroll with no coordinates.
+  On a lagged system the cursor could drift between the two calls, causing
+  the scroll to land at the wrong position. Pinning the coordinates to the
+  scroll call itself eliminates the race.
 """
 import asyncio
 import base64
@@ -40,8 +48,11 @@ def _needs_clipboard(text: str) -> bool:
 
 def _screenshot_b64() -> str | None:
     """Capture a screenshot and return it as a base64-encoded PNG string."""
+    # BUG 5 FIX: Removed `import PIL.Image` — it was never used.
+    # pyautogui.screenshot() returns a PIL Image internally without it.
+    # On some machines PIL is not importable under that exact name, causing
+    # ImportError here and breaking every confirm_screenshot call.
     try:
-        import PIL.Image  # pyautogui ships with Pillow
         img = pyautogui.screenshot()
         buf = io.BytesIO()
         img.save(buf, format="PNG")
@@ -70,8 +81,7 @@ async def mouse_click(
     Click at (x, y).
     button: 'left' | 'right' | 'middle'
     clicks: number of clicks (1 = single, 2 = double)
-    confirm_screenshot: if True, captures a screenshot after the click and
-        includes it as base64 PNG in the response under 'screenshot'.
+    confirm_screenshot: if True, captures a screenshot after the click.
     """
     await asyncio.to_thread(pyautogui.click, x, y, button=button, clicks=clicks, interval=0.08)
     result: dict = {
@@ -83,7 +93,7 @@ async def mouse_click(
         "clicks": clicks,
     }
     if confirm_screenshot:
-        await asyncio.sleep(0.15)  # let UI settle before capture
+        await asyncio.sleep(0.15)
         result["screenshot"] = await asyncio.to_thread(_screenshot_b64)
     return result
 
@@ -107,8 +117,12 @@ async def mouse_right_click(x: int, y: int) -> dict:
 
 
 async def mouse_scroll(x: int, y: int, clicks: int) -> dict:
-    await asyncio.to_thread(pyautogui.moveTo, x, y, duration=0.1)
-    await asyncio.to_thread(pyautogui.scroll, clicks)
+    # BUG 6 FIX: Pass x and y directly to pyautogui.scroll() instead of
+    # calling moveTo first then scroll with no coordinates.
+    # On a lagged system the cursor could drift between the two calls,
+    # causing the scroll to land at a different position than intended.
+    # pyautogui.scroll() accepts x and y keyword args to pin scroll position.
+    await asyncio.to_thread(pyautogui.scroll, clicks, x=x, y=y)
     return {"ok": True, "action": "mouse_scroll", "x": x, "y": y, "clicks": clicks}
 
 
@@ -120,7 +134,6 @@ async def mouse_drag(
 ) -> dict:
     """
     Click-drag from (x1,y1) to (x2,y2).
-    Useful for window repositioning, selecting text, slider controls, drag-and-drop.
     button: 'left' | 'right' | 'middle'
     """
     await asyncio.to_thread(pyautogui.moveTo, x1, y1, duration=0.15)
@@ -134,27 +147,22 @@ async def mouse_drag(
 
 def _clipboard_type_sync(text: str) -> dict:
     """
-    FIX (Task 8): Safe clipboard-paste path.
+    Safe clipboard-paste path.
     1. Saves existing clipboard content before overwriting.
     2. Verifies pyperclip.copy() actually wrote the correct text.
     3. Fires Ctrl+V to paste.
     4. Restores the original clipboard content afterward.
-    Returns a dict with ok, method, and an optional error key.
     """
     import pyperclip
-    # Step 1 — save current clipboard so we can restore it
     try:
         previous = pyperclip.paste()
     except Exception:
-        previous = ""  # clipboard was empty or unreadable; safe to treat as blank
+        previous = ""
 
-    # Step 2 — write our text to the clipboard
     pyperclip.copy(text)
 
-    # Step 3 — verify the write actually took (catches silent failures)
     actual = pyperclip.paste()
     if actual != text:
-        # Restore before raising so we don't leave garbage on the clipboard
         try:
             pyperclip.copy(previous)
         except Exception:
@@ -165,14 +173,12 @@ def _clipboard_type_sync(text: str) -> dict:
             "This usually means no clipboard daemon is running (e.g. xclip/xsel missing on Linux)."
         )
 
-    # Step 4 — paste
     pyautogui.hotkey("ctrl", "v")
 
-    # Step 5 — restore previous clipboard content
     try:
         pyperclip.copy(previous)
     except Exception:
-        pass  # best-effort restore; don't fail the whole type operation over this
+        pass
 
     return {"ok": True, "method": "clipboard"}
 
@@ -184,20 +190,17 @@ async def keyboard_type(
 ) -> dict:
     """
     Type a string. Uses clipboard-paste fallback for special chars (\n, @, #, etc.)
-    interval: seconds between keystrokes (only used in direct-write path)
-    confirm_screenshot: if True, captures a screenshot after typing and
-        includes it as base64 PNG in the response under 'screenshot'.
+    confirm_screenshot: if True, captures a screenshot after typing.
     """
     label = f"{text[:60]}{'...' if len(text) > 60 else ''}"
     result: dict = {"ok": True, "action": "keyboard_type", "text_preview": label}
 
     if _needs_clipboard(text):
         try:
-            import pyperclip  # noqa: F401 — check availability before thread
+            import pyperclip  # noqa: F401
             clip_result = await asyncio.to_thread(_clipboard_type_sync, text)
             result["method"] = clip_result["method"]
         except ImportError:
-            # pyperclip not installed — fall through to direct write
             await asyncio.to_thread(pyautogui.write, text, interval=interval)
             result["method"] = "direct_write_fallback"
             result["warning"] = "pyperclip not installed; special characters may be dropped."
