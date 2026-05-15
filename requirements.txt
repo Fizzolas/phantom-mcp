@@ -1,6 +1,6 @@
 # Phantom MCP — Python dependencies
-# Install with: py -3.11 -m pip install -r requirements.txt
-# Then install Playwright browsers: py -3.11 -m playwright install chromium
+# Core install:   pip install -r requirements.txt
+# After install:  python -m playwright install chromium
 
 # ── Core MCP server ───────────────────────────────────────────────────────────
 mcp>=1.0.0
@@ -22,15 +22,9 @@ winotify>=1.1.0
 
 # ── Web / search (headless Chromium) ─────────────────────────────────────────
 playwright>=1.44.0
-# After pip install: py -3.11 -m playwright install chromium
-
-# ── Feeds & DB ───────────────────────────────────────────────────────────────
-# (stdlib: sqlite3, xml.etree, urllib — no extra deps needed for core feeds)
 
 # ── OCR ──────────────────────────────────────────────────────────────────────
-# Option A (recommended, faster, no Tesseract binary needed):
 rapidocr-onnxruntime>=1.3.24
-# Option B (fallback, needs Tesseract binary installed separately):
 pytesseract>=0.3.10
 
 # ── Vision / object detection ────────────────────────────────────────────────
@@ -43,12 +37,16 @@ yt-dlp>=2024.5.27
 # ── Document reading ─────────────────────────────────────────────────────────
 pdfminer.six>=20221105
 python-docx>=1.1.2
+docx2txt>=0.8
 
 # ── QR code generation ───────────────────────────────────────────────────────
 qrcode[pil]>=7.4.2
 
 # ── Cloud storage ────────────────────────────────────────────────────────────
 boto3>=1.34.0
+
+# ── RSS / Atom feed parsing ───────────────────────────────────────────────────
+feedparser>=6.0.11
 
 # ── Memory & compression ─────────────────────────────────────────────────────
 numpy>=1.26.4
