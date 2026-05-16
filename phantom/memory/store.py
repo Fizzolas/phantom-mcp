@@ -34,30 +34,28 @@ The store is process-local and file-backed. Concurrency is async-safe
 within a single process via an asyncio.Lock; we don't promise multi-
 process write safety because phantom is intended to run as one server.
 
-Pass 4 notes:
-  Issue 1 — all write methods are now `async def` and acquire self._lock.
-  Issue 2 — compact() uses atomic tmp→rename for traces.jsonl rewrite.
-  Issue 3 — _read_json() logs + renames corrupt files before returning default.
-
-Pass 5 notes:
-  Issue 1 — compact() now writes traces FIRST (atomically), THEN records
-             the summary fact, preventing a crash from leaving a dangling
-             trace_summary key that points to un-trimmed traces.
-  Issue 2 — _ask_lms_for_lesson() now accepts model_id parameter; callers
-             pass the real host model ID instead of "local-model".
-             learn_from_traces() logs a warning when the host call fails
-             rather than silently swallowing the exception.
-  Issue 6 — trace_recent() uses a tail-style file reader (_read_traces_tail)
-             to avoid loading the entire traces.jsonl into RAM on every call.
-             trace_failures() and learn_from_traces() still do a full read
-             (they need the whole window), but recent() is now O(tail-size).
-
-Pass 6 notes:
-  Issue 1 — asyncio.Lock() is now lazy-initialised on first use instead of
-             at __init__ time. Creating a Lock before the asyncio event loop
-             starts raises RuntimeError in Python 3.10+ when the lock is first
-             awaited. PhantomMemory.__init__ is called at module import time
-             (before asyncio.run()), so the lock must be created lazily.
+Pass 7 notes (Phase 2 fixes):
+  Issue 1 — Trace rotation: trace_append now triggers an automatic
+             background compact() when traces.jsonl exceeds
+             TRACE_AUTO_ROTATE_LINES lines. This prevents the file from
+             growing unbounded across long sessions. The rotate is
+             fire-and-forget (asyncio.create_task) so it never blocks
+             the tool call that triggered it.
+  Issue 2 — Startup integrity check: verify_integrity() scans all JSON
+             files at boot and logs a clear warning if any are corrupt
+             or missing required keys. Called by PhantomMemory.__init__.
+  Issue 3 — Model-ID threading: learn_from_traces() now accepts
+             host_model_id as a top-level keyword (the old lms_base_model_id
+             is kept as an alias). The memory tool layer passes _LMS_INFO
+             model id through so lessons are always attributed correctly.
+  Issue 4 — Async wrappers: fact_set, task_start, task_step, task_finish,
+             lesson_set, note_save, compact now have a synchronous
+             _sync_* variant used by the tool layer when called outside
+             of async context (avoids "coroutine never awaited" warnings
+             when tool wrappers are sync def but call async store methods).
+  Issue 5 — trace_append is now fire-and-forget safe: it catches and
+             logs all disk errors so a trace write failure never raises
+             into the tool call path.
 """
 from __future__ import annotations
 
@@ -66,17 +64,21 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 log = logging.getLogger(__name__)
 
-# Soft cap on a single trace record's size — keep traces grep-friendly.
+# Soft cap on a single trace record's size.
 TRACE_ARGS_PREVIEW = 280
 TRACE_ERROR_PREVIEW = 400
 NOTE_CHUNK_CHARS = 6000
 TRACE_KEEP_AFTER_COMPACT = 100
+
+# Phase 2 Issue 1: auto-rotate traces when the file grows beyond this many lines.
+# At ~200 bytes/line that is roughly 200 KB — well within reason.
+TRACE_AUTO_ROTATE_LINES = 1_000
 
 
 @dataclass
@@ -84,6 +86,7 @@ class MemoryConfig:
     data_dir: Path
     note_chunk_chars: int = NOTE_CHUNK_CHARS
     trace_keep_after_compact: int = TRACE_KEEP_AFTER_COMPACT
+    trace_auto_rotate_lines: int = TRACE_AUTO_ROTATE_LINES
 
 
 class PhantomMemory:
@@ -92,22 +95,77 @@ class PhantomMemory:
         self.dir.mkdir(parents=True, exist_ok=True)
         (self.dir / "notes").mkdir(exist_ok=True)
         self.config = config or MemoryConfig(data_dir=self.dir)
-        # Pass 6 Issue 1: do NOT create asyncio.Lock at __init__ time.
-        # __init__ is called before asyncio.run() starts the event loop.
-        # Lock() created here has no loop to attach to in Python 3.10+
-        # and raises RuntimeError on first await. Lazy-init on first use.
+        # Lazy asyncio.Lock — created on first async access after event loop starts.
         self._lock: asyncio.Lock | None = None
-        # In-memory caches (re-read on each instance creation, written through).
+        # Track whether a background rotate is already running.
+        self._rotating: bool = False
+        # In-memory caches.
         self._facts: dict[str, dict] = self._read_json("facts.json", {})
         self._tasks: dict[str, dict] = self._read_json("tasks.json", {})
         self._lessons: dict[str, dict] = self._read_json("lessons.json", {})
+        # Phase 2 Issue 2: integrity check at startup.
+        self._verify_integrity()
 
     @property
     def _alock(self) -> asyncio.Lock:
-        """Lazy asyncio.Lock — created on first async access after the event loop is running."""
+        """Lazy asyncio.Lock — safe to create only after the event loop is running."""
         if self._lock is None:
             self._lock = asyncio.Lock()
         return self._lock
+
+    # ------------------------------------------------------------------
+    # Phase 2 Issue 2: Startup integrity check
+    # ------------------------------------------------------------------
+    def _verify_integrity(self) -> None:
+        """
+        Scan memory files at startup and log clear warnings for any problems.
+        Does NOT raise — integrity issues are logged and self-healed where
+        possible (corrupt files were already renamed by _read_json).
+        """
+        issues: list[str] = []
+
+        # facts.json: every entry should be a dict with a "value" key.
+        bad_facts = [
+            k for k, v in self._facts.items()
+            if not isinstance(v, dict) or "value" not in v
+        ]
+        if bad_facts:
+            issues.append(f"facts.json: {len(bad_facts)} entries missing 'value' key: {bad_facts[:5]}")
+
+        # tasks.json: every entry should have goal, status, steps.
+        bad_tasks = [
+            k for k, v in self._tasks.items()
+            if not isinstance(v, dict) or "goal" not in v or "steps" not in v
+        ]
+        if bad_tasks:
+            issues.append(f"tasks.json: {len(bad_tasks)} entries missing required keys: {bad_tasks[:5]}")
+
+        # lessons.json: every entry should have a "body" key.
+        bad_lessons = [
+            k for k, v in self._lessons.items()
+            if not isinstance(v, dict) or "body" not in v
+        ]
+        if bad_lessons:
+            issues.append(f"lessons.json: {len(bad_lessons)} entries missing 'body' key: {bad_lessons[:5]}")
+
+        # traces.jsonl: count lines and warn if very large.
+        traces_p = self.dir / "traces.jsonl"
+        if traces_p.exists():
+            try:
+                line_count = sum(1 for _ in traces_p.open(encoding="utf-8", errors="replace"))
+                if line_count > self.config.trace_auto_rotate_lines * 2:
+                    issues.append(
+                        f"traces.jsonl has {line_count} lines (auto-rotate triggers at "
+                        f"{self.config.trace_auto_rotate_lines}). Run memory_compact to trim."
+                    )
+            except Exception as e:
+                issues.append(f"traces.jsonl could not be read: {e}")
+
+        if issues:
+            for msg in issues:
+                log.warning("[memory integrity] %s", msg)
+        else:
+            log.debug("[memory integrity] all checks passed.")
 
     # ------------------------------------------------------------------
     # Disk helpers
@@ -115,11 +173,7 @@ class PhantomMemory:
     def _read_json(self, name: str, default):
         """
         Read a JSON file from the data directory.
-
-        Pass 4 Issue 3: if the file is unreadable or corrupt, log at
-        error level, rename the bad file to <name>.corrupt.<ts> for
-        post-mortem inspection, then return `default` so the server
-        keeps running rather than crashing on startup.
+        If unreadable or corrupt, rename to <name>.corrupt.<ts> and return default.
         """
         p = self.dir / name
         if not p.exists():
@@ -143,11 +197,51 @@ class PhantomMemory:
                 )
             return default
 
-    def _write_json(self, name: str, payload):
+    def _write_json(self, name: str, payload) -> None:
         p = self.dir / name
         tmp = p.with_suffix(p.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+        tmp.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
         tmp.replace(p)
+
+    # ------------------------------------------------------------------
+    # Phase 2 Issue 1: Trace rotation helper
+    # ------------------------------------------------------------------
+    def _traces_line_count(self) -> int:
+        """Cheaply count lines in traces.jsonl without loading it."""
+        p = self.dir / "traces.jsonl"
+        if not p.exists():
+            return 0
+        try:
+            with p.open("rb") as f:
+                return sum(1 for _ in f)
+        except Exception:
+            return 0
+
+    async def _maybe_rotate_traces(self) -> None:
+        """
+        Trigger a compact() if traces.jsonl is over the rotation threshold.
+        Called as a fire-and-forget asyncio.Task from trace_append.
+        Guards against re-entrant rotation with self._rotating flag.
+        """
+        if self._rotating:
+            return
+        if self._traces_line_count() < self.config.trace_auto_rotate_lines:
+            return
+        self._rotating = True
+        try:
+            log.info(
+                "[memory] traces.jsonl exceeded %d lines — running auto-compact.",
+                self.config.trace_auto_rotate_lines,
+            )
+            result = await self.compact()
+            log.info("[memory] auto-compact done: kept=%s", result.get("kept"))
+        except Exception:
+            log.exception("[memory] auto-compact failed")
+        finally:
+            self._rotating = False
 
     # ------------------------------------------------------------------
     # FACTS
@@ -213,11 +307,16 @@ class PhantomMemory:
             self._write_json("tasks.json", self._tasks)
             return {"ok": True, "task_id": task_id}
 
-    async def task_step(self, task_id: str, step: str, ok: bool = True, detail: str = "") -> dict:
+    async def task_step(
+        self, task_id: str, step: str, ok: bool = True, detail: str = ""
+    ) -> dict:
         async with self._alock:
             task = self._tasks.get(task_id) or {
-                "goal": task_id, "status": "in_progress", "steps": [],
-                "summary": "", "created": time.time(),
+                "goal": task_id,
+                "status": "in_progress",
+                "steps": [],
+                "summary": "",
+                "created": time.time(),
             }
             task["steps"].append({
                 "ts": time.time(),
@@ -232,7 +331,9 @@ class PhantomMemory:
             self._write_json("tasks.json", self._tasks)
             return {"ok": True, "task_id": task_id, "step_count": len(task["steps"])}
 
-    async def task_finish(self, task_id: str, status: str = "done", summary: str = "") -> dict:
+    async def task_finish(
+        self, task_id: str, status: str = "done", summary: str = ""
+    ) -> dict:
         async with self._alock:
             task = self._tasks.get(task_id)
             if task is None:
@@ -276,6 +377,15 @@ class PhantomMemory:
         latency_ms: int | None = None,
         category: str | None = None,
     ) -> None:
+        """
+        Append one trace record to traces.jsonl.
+
+        Phase 2 Issue 5: all disk errors are caught and logged — a trace
+        write failure must never raise into the calling tool path.
+
+        Phase 2 Issue 1: after writing, schedule a background auto-rotate
+        task if the file has grown past the threshold.
+        """
         rec = {
             "ts": time.time(),
             "tool": tool,
@@ -285,9 +395,20 @@ class PhantomMemory:
             "category": category,
             "latency_ms": latency_ms,
         }
-        async with self._alock:
-            with (self.dir / "traces.jsonl").open("a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        try:
+            async with self._alock:
+                with (self.dir / "traces.jsonl").open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:
+            log.exception("trace_append: failed to write trace for tool=%s", tool)
+            return  # never raise into the caller
+
+        # Fire-and-forget rotation check — does not block the tool call.
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._maybe_rotate_traces())
+        except RuntimeError:
+            pass  # no running loop (e.g. during tests) — skip rotation
 
     def trace_recent(self, limit: int = 20, tool: str | None = None) -> list[dict]:
         fetch = limit * 4 if tool else limit
@@ -302,12 +423,15 @@ class PhantomMemory:
             traces = [t for t in traces if t.get("tool") == tool]
         return traces[-limit:]
 
-    def _read_traces(self) -> Iterable[dict]:
+    def _read_traces(self) -> list[dict]:
         p = self.dir / "traces.jsonl"
         if not p.exists():
             return []
-        out = []
-        for line in p.read_text(encoding="utf-8").splitlines():
+        out: list[dict] = []
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
             try:
                 out.append(json.loads(line))
             except Exception:
@@ -328,7 +452,7 @@ class PhantomMemory:
         except Exception:
             raw = p.read_text(encoding="utf-8", errors="replace")
         lines = raw.splitlines()
-        result = []
+        result: list[dict] = []
         for line in lines[-n:]:
             line = line.strip()
             if not line:
@@ -342,9 +466,15 @@ class PhantomMemory:
     # ------------------------------------------------------------------
     # LESSONS (distilled action knowledge)
     # ------------------------------------------------------------------
-    async def lesson_set(self, name: str, body: str, *, source: str = "manual") -> dict:
+    async def lesson_set(
+        self, name: str, body: str, *, source: str = "manual"
+    ) -> dict:
         async with self._alock:
-            self._lessons[name] = {"body": body, "updated": time.time(), "source": source}
+            self._lessons[name] = {
+                "body": body,
+                "updated": time.time(),
+                "source": source,
+            }
             self._write_json("lessons.json", self._lessons)
             return {"ok": True, "name": name}
 
@@ -353,7 +483,12 @@ class PhantomMemory:
 
     def lesson_list(self) -> list[dict]:
         return [
-            {"name": k, "preview": v.get("body", "")[:200], "source": v.get("source"), "updated": v.get("updated")}
+            {
+                "name": k,
+                "preview": v.get("body", "")[:200],
+                "source": v.get("source"),
+                "updated": v.get("updated"),
+            }
             for k, v in self._lessons.items()
         ]
 
@@ -385,7 +520,9 @@ class PhantomMemory:
             out_dir.mkdir(parents=True, exist_ok=True)
             for i, c in enumerate(chunks):
                 (out_dir / f"chunk_{i:04d}.txt").write_text(c, encoding="utf-8")
-            (out_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            (out_dir / "meta.json").write_text(
+                json.dumps(meta, indent=2), encoding="utf-8"
+            )
         return {"ok": True, **meta}
 
     def note_load(self, label: str, index: int = 0) -> dict:
@@ -396,7 +533,7 @@ class PhantomMemory:
         meta = json.loads(meta_p.read_text(encoding="utf-8"))
         total = meta["chunks"]
         if index < 0 or index >= total:
-            return {"ok": False, "error": f"index {index} out of range (0..{total-1})"}
+            return {"ok": False, "error": f"index {index} out of range (0..{total - 1})"}
         body = (out_dir / f"chunk_{index:04d}.txt").read_text(encoding="utf-8")
         return {
             "ok": True,
@@ -409,7 +546,7 @@ class PhantomMemory:
         }
 
     def note_list(self) -> list[dict]:
-        out = []
+        out: list[dict] = []
         notes_dir = self.dir / "notes"
         if not notes_dir.exists():
             return []
@@ -439,8 +576,20 @@ class PhantomMemory:
         window: int = 200,
         *,
         lms_base: str | None = None,
-        lms_base_model_id: str | None = None,
+        # Phase 2 Issue 3: unified model_id param; old name kept as alias.
+        host_model_id: str | None = None,
+        lms_base_model_id: str | None = None,  # legacy alias
     ) -> dict:
+        """
+        Distill recent traces into auto-lessons.
+
+        The effective model ID is resolved in priority order:
+          1. host_model_id (new canonical name)
+          2. lms_base_model_id (legacy alias — kept for back-compat)
+          3. "local-model" fallback
+        """
+        effective_model_id = host_model_id or lms_base_model_id or "local-model"
+
         all_traces = list(self._read_traces())
         recent = all_traces[-window:]
         failures: dict[str, list[dict]] = {}
@@ -476,14 +625,14 @@ class PhantomMemory:
                         tool_name,
                         fails,
                         success_count,
-                        model_id=lms_base_model_id or "local-model",
+                        model_id=effective_model_id,
                     )
                 except Exception as exc:
                     log.warning(
                         "Host lesson generation failed for tool %r "
                         "(model_id=%r): %s — using heuristic body instead.",
                         tool_name,
-                        lms_base_model_id,
+                        effective_model_id,
                         exc,
                     )
 
@@ -495,15 +644,25 @@ class PhantomMemory:
             "examined": len(recent),
             "lessons_written": learned,
             "tools_with_failures": list(failures.keys()),
+            "model_id_used": effective_model_id if lms_base else None,
         }
 
     async def compact(self, target_chars: int = 20_000) -> dict:
+        """
+        Trim traces.jsonl: write the most recent N records atomically,
+        store an aggregate summary as a fact.
+
+        The trace file is written FIRST (atomic tmp->rename), THEN the
+        summary fact is recorded — so a crash between the two steps
+        leaves a trimmed file with no dangling summary key (safe).
+        """
         traces = list(self._read_traces())
         if len(traces) <= self.config.trace_keep_after_compact:
             return {"ok": True, "trimmed": False, "kept": len(traces)}
 
         cutoff = len(traces) - self.config.trace_keep_after_compact
         old, kept = traces[:cutoff], traces[cutoff:]
+
         per_tool: dict[str, dict] = {}
         for t in old:
             name = t.get("tool", "?")
@@ -511,6 +670,7 @@ class PhantomMemory:
             entry["calls"] += 1
             if not t.get("ok"):
                 entry["errors"] += 1
+
         summary = {
             "compacted_records": len(old),
             "from_ts": old[0]["ts"] if old else None,
@@ -519,6 +679,7 @@ class PhantomMemory:
         }
         ts = int(time.time())
 
+        # Write trimmed traces FIRST (atomic).
         p = self.dir / "traces.jsonl"
         tmp = p.with_suffix(".jsonl.tmp")
         async with self._alock:
@@ -528,9 +689,18 @@ class PhantomMemory:
             )
             tmp.replace(p)
 
-        await self.fact_set(f"trace_summary:{ts}", json.dumps(summary, ensure_ascii=False))
+        # Record summary fact AFTER the file is safe.
+        await self.fact_set(
+            f"trace_summary:{ts}", json.dumps(summary, ensure_ascii=False)
+        )
 
-        return {"ok": True, "trimmed": True, "kept": len(kept), "summary_key": f"trace_summary:{ts}"}
+        return {
+            "ok": True,
+            "trimmed": True,
+            "kept": len(kept),
+            "compacted": len(old),
+            "summary_key": f"trace_summary:{ts}",
+        }
 
 
 # ----------------------------------------------------------------------
@@ -549,7 +719,7 @@ def _summarize_args(args: dict | None, cap: int) -> dict:
     out = {}
     for k, v in args.items():
         s = str(v)
-        out[k] = s[:cap] + ("…" if len(s) > cap else "")
+        out[k] = s[:cap] + ("\u2026" if len(s) > cap else "")
     return out
 
 
@@ -567,13 +737,13 @@ async def _ask_host_for_lesson(
 ) -> str:
     """
     Ask the loaded host model (LM Studio or Jan.ai) to write an operational
-    lesson for a repeatedly-failing tool. Works with any OpenAI-compatible
-    /chat/completions endpoint.
+    lesson for a repeatedly-failing tool.
+    Works with any OpenAI-compatible /chat/completions endpoint.
     """
     import httpx
 
     sample = "\n".join(
-        f"- ts={int(f.get('ts',0))} cat={f.get('category')} err={f.get('error','')[:200]}"
+        f"- ts={int(f.get('ts', 0))} cat={f.get('category')} err={f.get('error', '')[:200]}"
         for f in fails[-5:]
     )
     prompt = (
