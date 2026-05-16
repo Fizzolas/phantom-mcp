@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 echo ============================================================
-echo  Phantom MCP — Installer
+echo  Phantom MCP -- Installer
 echo  Sets up the Python environment and all dependencies.
 echo ============================================================
 echo.
@@ -107,11 +107,15 @@ if errorlevel 1 (
     echo        ok=false with a clear error and the install hint above.
     echo.
 ) else (
-    for /f "tokens=*" %%t in ('tesseract --version 2^>^&1 ^| findstr /i "tesseract"') do (
-        echo [OK] Found %%t
-        goto :tesseract_found
+    :: Capture version without goto inside a for block (fixes "unexpected at this time")
+    set TESS_VER=unknown
+    for /f "tokens=*" %%t in ('tesseract --version 2^>^&1') do (
+        if not defined TESS_FOUND (
+            set TESS_VER=%%t
+            set TESS_FOUND=1
+        )
     )
-    :tesseract_found
+    echo [OK] Found Tesseract: %TESS_VER%
 )
 
 :: -------------------------------------------------------------------
@@ -125,17 +129,30 @@ if not exist data   mkdir data
 echo [OK] Directories ready (memory, logs, data)
 
 :: -------------------------------------------------------------------
-:: 8. Verify LM Studio is reachable (optional, soft check)
+:: 8. Check for reachable AI host (LM Studio or Jan.ai)
 :: -------------------------------------------------------------------
 echo.
-echo [..] Checking LM Studio API at http://localhost:1234 ...
+echo [..] Checking for AI host (LM Studio port 1234, Jan.ai port 1337)...
+
+set HOST_FOUND=0
+
 curl -s --max-time 3 http://localhost:1234/v1/models >nul 2>&1
-if errorlevel 1 (
-    echo [WARN] LM Studio not reachable on port 1234.
-    echo        Start LM Studio, load a model, and enable the local server
-    echo        before running launch.bat.
-) else (
-    echo [OK] LM Studio API is reachable
+if not errorlevel 1 (
+    echo [OK] LM Studio API is reachable at http://localhost:1234
+    set HOST_FOUND=1
+)
+
+curl -s --max-time 3 http://localhost:1337/v1/models >nul 2>&1
+if not errorlevel 1 (
+    echo [OK] Jan.ai API is reachable at http://localhost:1337
+    set HOST_FOUND=1
+)
+
+if %HOST_FOUND%==0 (
+    echo [WARN] No AI host found on port 1234 (LM Studio) or 1337 (Jan.ai).
+    echo        Phantom will start in offline mode (memory/file/shell tools still work).
+    echo        Start LM Studio or Jan.ai with a model loaded before running launch.bat
+    echo        if you want the model to be able to use AI-assisted features.
 )
 
 :: -------------------------------------------------------------------
@@ -146,8 +163,9 @@ echo ============================================================
 echo  Installation complete!
 echo.
 echo  REQUIRED before first run:
-echo    - LM Studio running with a model loaded (local server on port 1234)
-echo    - Tesseract-OCR installed + on PATH (for OCR tools)
+echo    - LM Studio (port 1234) OR Jan.ai (port 1337) running with
+echo      a model loaded and local server enabled
+echo    - Tesseract-OCR installed + on PATH (for OCR tools only)
 echo.
 echo  Run launch.bat to start the Phantom MCP server.
 echo ============================================================
