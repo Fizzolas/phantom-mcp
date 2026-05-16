@@ -12,7 +12,7 @@ defined helper that:
   * runs a self-check checklist on a draft answer or planned action,
   * classifies the risk of an intended tool call against a small,
     inspectable rule set,
-  * records intent → outcome pairs and promotes durable patterns into
+  * records intent -> outcome pairs and promotes durable patterns into
     lessons via the existing learning path.
 
 All outputs are bounded by character caps so the runtime token-budget
@@ -35,6 +35,13 @@ Pass 5 notes:
              minimum count (STUCK_FAILURE_THRESHOLD) AND a minimum ratio
              (>=50%) so that a handful of failures in a healthy run does
              not falsely trigger stuck recovery.
+
+Async-correctness pass (memory review):
+  All calls to async store methods (task_start, task_step, fact_set,
+  fact_delete, lesson_set) are now properly awaited throughout.
+  goal_start() changed from sync def to async def to allow awaiting
+  task_start and task_step. _save_plan() changed from sync def to
+  async def and now awaits fact_set. All callers of _save_plan updated.
 """
 from __future__ import annotations
 
@@ -48,8 +55,7 @@ from typing import Any
 from phantom.memory.store import PhantomMemory
 
 # ----------------------------------------------------------------------
-# Caps — kept small so the budget manager never has to truncate cognition
-# state on tight context models (4k-8k). Increase only if you measure.
+# Caps
 # ----------------------------------------------------------------------
 PLAN_STEP_MAX = 50
 PLAN_STEP_CHARS = 280
@@ -60,25 +66,18 @@ STATUS_LESSONS_TOP_K = 5
 STATUS_RECENT_TRACES = 5
 STATUS_RECENT_FAILURES = 5
 
-# Confidence bands. Names are deliberately plain so a small LM Studio
-# model can reason about them without re-mapping. The numeric score is
-# always 0..100.
 CONFIDENCE_BANDS = (
-    (85, "high"),     # safe to proceed; verify after.
-    (60, "moderate"), # proceed with care; surface assumptions.
-    (35, "low"),      # gather more info before acting.
-    (0,  "very_low"), # do not act; ask user or re-observe.
+    (85, "high"),
+    (60, "moderate"),
+    (35, "low"),
+    (0,  "very_low"),
 )
 
-# Stuck-detector heuristics
-STUCK_RECENT_WINDOW = 8         # how many trailing traces to inspect
-STUCK_FAILURE_THRESHOLD = 3     # >=N failures inside the window = potential stuck
-STUCK_FAILURE_RATIO = 0.5       # Pass 5 Issue 5: also require >=50% failure rate
-STUCK_REPEAT_THRESHOLD = 3      # same tool+similar args N times in a row
+STUCK_RECENT_WINDOW = 8
+STUCK_FAILURE_THRESHOLD = 3
+STUCK_FAILURE_RATIO = 0.5
+STUCK_REPEAT_THRESHOLD = 3
 
-# Tool-name patterns that suggest an irreversible or high-impact action.
-# These are informational only — the cognition layer never blocks a call;
-# it just returns a "caution" recommendation the model should heed.
 _HIGH_IMPACT_PATTERNS = (
     re.compile(r"^process_kill$"),
     re.compile(r"^shell_(cmd|powershell|python)$"),
@@ -106,15 +105,9 @@ class AgentCognition:
 
     def __init__(self, memory: PhantomMemory) -> None:
         self.mem = memory
-        # Pass 3 Issue 4: per-task locks for read-modify-write methods.
-        # _locks_lock guards the dict itself against concurrent first-access
-        # for the same task_id.
         self._task_locks: dict[str, asyncio.Lock] = {}
         self._locks_lock = asyncio.Lock()
 
-    # ------------------------------------------------------------------
-    # Internal: acquire the per-task lock (creates it on first use).
-    # ------------------------------------------------------------------
     async def _task_lock(self, task_id: str) -> asyncio.Lock:
         async with self._locks_lock:
             if task_id not in self._task_locks:
@@ -124,7 +117,7 @@ class AgentCognition:
     # ------------------------------------------------------------------
     # GOAL + PLAN
     # ------------------------------------------------------------------
-    def goal_start(
+    async def goal_start(
         self,
         task_id: str,
         goal: str,
@@ -134,21 +127,20 @@ class AgentCognition:
     ) -> dict:
         """
         Start a goal (= a task in PhantomMemory) with optional acceptance
-        criteria and constraints. Acceptance + constraints are stored as
-        the first plan-step record so the model can recall them later.
+        criteria and constraints.
         """
         goal = (goal or "").strip()[:GOAL_CHARS]
         if not goal:
             return {"ok": False, "error": "goal must be non-empty"}
 
-        self.mem.task_start(task_id, goal)
+        await self.mem.task_start(task_id, goal)
         framing_bits = []
         if acceptance:
             framing_bits.append(f"acceptance: {acceptance.strip()[:ACCEPTANCE_CHARS]}")
         if constraints:
             framing_bits.append(f"constraints: {constraints.strip()[:ACCEPTANCE_CHARS]}")
         if framing_bits:
-            self.mem.task_step(
+            await self.mem.task_step(
                 task_id,
                 step="goal_framing",
                 ok=True,
@@ -170,8 +162,7 @@ class AgentCognition:
     async def plan_set(self, task_id: str, steps: list[str]) -> dict:
         """
         Store an ordered plan. The plan lives as a fact named
-        plan:<task_id> so it survives across calls and sessions, and is
-        also written as a task step so the task timeline shows it.
+        plan:<task_id> so it survives across calls and sessions.
         """
         task = self.mem.task_get(task_id)
         if not task.get("ok"):
@@ -188,8 +179,8 @@ class AgentCognition:
         lock = await self._task_lock(task_id)
         async with lock:
             plan_doc = {"steps": cleaned, "cursor": 0, "updated": time.time()}
-            self.mem.fact_set(f"plan:{task_id}", json.dumps(plan_doc, ensure_ascii=False))
-            self.mem.task_step(
+            await self._save_plan(task_id, plan_doc)
+            await self.mem.task_step(
                 task_id,
                 step=f"plan_set ({len(cleaned)} steps)",
                 ok=True,
@@ -206,9 +197,10 @@ class AgentCognition:
         except Exception:
             return None
 
-    def _save_plan(self, task_id: str, plan: dict) -> None:
+    async def _save_plan(self, task_id: str, plan: dict) -> None:
+        """Async: writes plan to fact store. Must be called with await."""
         plan["updated"] = time.time()
-        self.mem.fact_set(f"plan:{task_id}", json.dumps(plan, ensure_ascii=False))
+        await self.mem.fact_set(f"plan:{task_id}", json.dumps(plan, ensure_ascii=False))
 
     async def plan_advance(self, task_id: str, *, step_ok: bool, note: str = "") -> dict:
         """Mark the current step done (or failed) and move the cursor."""
@@ -223,8 +215,8 @@ class AgentCognition:
                 return {"ok": True, "task_id": task_id, "done": True, "cursor": cursor}
             current = steps[cursor]
             plan["cursor"] = cursor + 1
-            self._save_plan(task_id, plan)
-            self.mem.task_step(
+            await self._save_plan(task_id, plan)
+            await self.mem.task_step(
                 task_id,
                 step=f"plan_step[{cursor}]: {current}",
                 ok=bool(step_ok),
@@ -244,8 +236,7 @@ class AgentCognition:
     def next_action(self, task_id: str) -> dict:
         """
         Return a compact packet with: current goal, current plan step,
-        nearby facts, lessons, and recent failure summaries — everything
-        the model needs to decide its next concrete tool call.
+        nearby facts, lessons, and recent failure summaries.
         """
         task = self.mem.task_get(task_id)
         if not task.get("ok"):
@@ -286,9 +277,7 @@ class AgentCognition:
             "hint": (
                 "If stuck.stuck is true, call agent_recover or agent_replan "
                 "before issuing the next tool call. Otherwise pick the single "
-                "next tool call that advances current_step. If current_step is "
-                "null, the plan is exhausted — call agent_after_action_review "
-                "and either finish or replan."
+                "next tool call that advances current_step."
             ),
         }
 
@@ -313,10 +302,7 @@ class AgentCognition:
     def reflect(self, draft: str, *, kind: str = "answer") -> dict:
         """
         Run a deterministic self-check checklist over a draft answer or
-        a draft plan/action. Returns concrete questions for the model to
-        answer back (the "ouroboros" recursive check). The cognition
-        layer never silently rewrites the draft — it surfaces the
-        questions and lets the mind decide.
+        a draft plan/action.
         """
         d = (draft or "").strip()
         if not d:
@@ -337,7 +323,6 @@ class AgentCognition:
             checklist.append(
                 "Does the draft tell the user something a follow-up tool call could verify? If so, mention the verification."
             )
-        # Cheap heuristic flags so the model can prioritize.
         flags: list[str] = []
         if any(tok in d.lower() for tok in _IRREVERSIBLE_TOKENS):
             flags.append("contains_irreversible_phrasing")
@@ -345,14 +330,12 @@ class AgentCognition:
             flags.append("contains_unfinished_marker")
         if len(d) > 4000:
             flags.append("draft_is_very_long_consider_chunking")
-        # Hedge / uncertainty markers reduce confidence.
         low = d.lower()
         if any(w in low for w in ("i think", "probably", "should be", "i guess", "maybe")):
             flags.append("contains_uncertainty_markers")
         if any(w in low for w in ("safety", "danger", "permanent")):
             flags.append("safety_language_present")
 
-        # Categorize concerns so the caller sees structure, not just a list.
         categories = {
             "correctness": "Are claims backed by observed evidence (facts, recent tool results)?",
             "completeness": "Does the draft cover the user's full ask, including edge cases?",
@@ -363,8 +346,7 @@ class AgentCognition:
             "next_verification": "What is the cheapest next observation to confirm or refute the draft?",
         }
 
-        # Confidence band. Heuristic, deterministic.
-        confidence = 70  # baseline for a non-empty draft
+        confidence = 70
         if "contains_irreversible_phrasing" in flags:
             confidence -= 25
         if "contains_unfinished_marker" in flags:
@@ -398,11 +380,8 @@ class AgentCognition:
 
     def risk_check(self, tool_name: str, args: dict[str, Any] | None = None) -> dict:
         """
-        Classify the risk of an intended tool call. Returns level=
-        'go' | 'caution' | 'block'. The model is expected to honor a
-        'block' result by asking the user before proceeding.
-
-        This function never touches the file system or runs the tool.
+        Classify the risk of an intended tool call.
+        Returns level= 'go' | 'caution' | 'block'.
         """
         args = args or {}
         reasons: list[str] = []
@@ -415,14 +394,12 @@ class AgentCognition:
             reasons.append(f"{tool_name} is in the high-impact tool set")
             level = "caution"
 
-        # Argument heuristics.
         flat = " ".join(str(v) for v in args.values()).lower()
         if any(tok in flat for tok in _IRREVERSIBLE_TOKENS):
             irreversible = True
             reasons.append("arguments contain a phrase typical of irreversible operations")
             level = "caution"
 
-        # File-write / delete on a path that looks user-owned.
         path = args.get("path") or args.get("file") or args.get("dest") or ""
         if isinstance(path, str) and path:
             lower = path.lower()
@@ -435,7 +412,6 @@ class AgentCognition:
                 reasons.append(f"path '{path}' targets system directories")
                 level = "block"
 
-        # shell commands that look destructive get blocked outright.
         cmd = (args.get("command") or args.get("script") or "")
         if isinstance(cmd, str) and cmd:
             low = cmd.lower()
@@ -470,8 +446,7 @@ class AgentCognition:
         expected: str,
     ) -> dict:
         """
-        Record the model's *intent* before it acts: what it is about to
-        do and what it expects to observe. Paired with after_action_review.
+        Record the model's intent before it acts.
         """
         intent = (intent or "").strip()[:PLAN_STEP_CHARS]
         expected = (expected or "").strip()[:PLAN_STEP_CHARS]
@@ -480,14 +455,14 @@ class AgentCognition:
         cp_id = f"cp:{task_id}:{int(time.time() * 1000)}"
         lock = await self._task_lock(task_id)
         async with lock:
-            self.mem.fact_set(
+            await self.mem.fact_set(
                 cp_id,
                 json.dumps(
                     {"task_id": task_id, "intent": intent, "expected": expected, "ts": time.time()},
                     ensure_ascii=False,
                 ),
             )
-            self.mem.task_step(
+            await self.mem.task_step(
                 task_id,
                 step=f"checkpoint: {intent}",
                 ok=True,
@@ -504,14 +479,9 @@ class AgentCognition:
         promote_lesson: bool = True,
     ) -> dict:
         """
-        Compare expected vs observed for a previous checkpoint. On
-        repeated success of the same intent pattern, optionally promote
-        a short lesson the model can read on future calls.
+        Compare expected vs observed for a previous checkpoint.
 
-        Pass 5 Issue 3: the checkpoint fact is now deleted AFTER lesson_set
-        succeeds. If lesson_set raises (e.g. disk full), the checkpoint is
-        preserved so the AAR can be retried without losing either the
-        checkpoint or the lesson.
+        Pass 5 Issue 3: checkpoint fact deleted AFTER lesson_set succeeds.
         """
         f = self.mem.fact_get(checkpoint_id)
         if not f.get("ok"):
@@ -529,7 +499,7 @@ class AgentCognition:
         lock = await self._task_lock(task_id)
         async with lock:
             diff_summary = _compare(expected, observed_clipped)
-            self.mem.task_step(
+            await self.mem.task_step(
                 task_id,
                 step=f"AAR: {intent}",
                 ok=bool(success),
@@ -552,14 +522,9 @@ class AgentCognition:
                         f"When intent is '{intent[:120]}', expecting '{expected[:120]}' "
                         f"reliably worked. Reuse this approach instead of exploring."
                     )
-                    # Pass 5 Issue 3: lesson_set FIRST — if it raises, we fall
-                    # through without deleting the checkpoint, preserving both.
                     await self.mem.lesson_set(lesson_name, lesson_body, source="auto-aar")
                     promoted = lesson_name
 
-            # Pass 5 Issue 3: delete the checkpoint ONLY after all writes above
-            # have succeeded. A crash or disk error in lesson_set will leave the
-            # checkpoint intact so the AAR can be retried.
             await self.mem.fact_delete(checkpoint_id)
 
         return {
@@ -582,17 +547,7 @@ class AgentCognition:
     ) -> dict:
         """
         Deeply pre-process a goal, action draft, tool-call plan, or answer
-        draft *before* it is acted on. Returns a structured packet:
-          - intent: one-line restatement of what the model thinks is being asked
-          - assumptions: things the draft seems to take for granted
-          - missing_info: gaps the model should close before acting
-          - likely_consequences: what will probably happen if executed
-          - reversibility: 'reversible' | 'partial' | 'irreversible' | 'unknown'
-          - evidence: facts/lessons/traces that back the subject
-          - questions_to_ask: prompts the model should answer to itself first
-          - recommendation: 'proceed' | 'clarify' | 'gather_more_info' | 'do_not_act'
-
-        kind = 'goal' | 'action' | 'answer' | 'plan'.
+        draft before it is acted on.
         """
         s = (subject or "").strip()
         if not s:
@@ -608,8 +563,6 @@ class AgentCognition:
             else "unknown"
         )
 
-        # Evidence retrieval — facts + lessons + recent failures whose tool
-        # name or error overlaps with the subject text.
         evidence_facts = self.mem.fact_search(s, top_k=STATUS_FACTS_TOP_K)
         lessons = self.mem.lesson_list()[:STATUS_LESSONS_TOP_K]
         recent_failures = [
@@ -621,7 +574,6 @@ class AgentCognition:
             if f["tool"] and f["tool"].lower() in low
         ]
 
-        # Heuristic assumptions/missing-info detection.
         assumptions: list[str] = []
         missing_info: list[str] = []
         if kind in {"action", "plan"}:
@@ -713,22 +665,17 @@ class AgentCognition:
         tool_name: str | None = None,
         args: dict[str, Any] | None = None,
     ) -> dict:
-        """
-        Compute a deterministic 0..100 confidence score for a proposed
-        goal/action/answer.
-        """
+        """Compute a deterministic 0..100 confidence score."""
         u = self.understand(subject, kind=kind, task_id=task_id)
         if not u.get("ok"):
             return u
 
         score = 50
-
         ev_facts = u["evidence"]["facts"]
         if ev_facts:
             score += min(20, 5 * len(ev_facts))
         if u["evidence"]["lessons"]:
             score += 5
-
         score -= 10 * len(u["missing_info"])
         if u["reversibility"] == "irreversible":
             score -= 15
@@ -806,9 +753,8 @@ class AgentCognition:
         rationale: str = "",
     ) -> dict:
         """
-        One-stop pre-action review used right before calling a tool.
-        Combines understand(), risk_check(), and confidence_check() into
-        a single compact packet so the model only pays one round-trip.
+        One-stop pre-action review combining understand, risk_check, and
+        confidence_check into a single compact packet.
         """
         args = args or {}
         subject = rationale or f"call {tool_name} with {list(args.keys())}"
@@ -849,12 +795,9 @@ class AgentCognition:
     # ------------------------------------------------------------------
     def stuck_detect(self, task_id: str | None = None) -> dict:
         """
-        Detect repeated failures or thrashing and recommend a recovery path.
+        Detect repeated failures or thrashing.
 
-        Pass 5 Issue 5: the failure-count check now also requires a minimum
-        failure *ratio* (STUCK_FAILURE_RATIO = 0.5). Three failures out of
-        eight traces is only 37.5% — not necessarily stuck. Both conditions
-        must be true to emit the failure signal.
+        Pass 5 Issue 5: requires BOTH minimum failure count AND ratio >= 50%.
         """
         traces = self.mem.trace_recent(limit=STUCK_RECENT_WINDOW)
         signals: list[str] = []
@@ -871,7 +814,6 @@ class AgentCognition:
 
         fails = [t for t in traces if not t.get("ok")]
         failure_ratio = len(fails) / len(traces)
-        # Pass 5 Issue 5: require BOTH minimum count AND minimum ratio.
         if len(fails) >= STUCK_FAILURE_THRESHOLD and failure_ratio >= STUCK_FAILURE_RATIO:
             signals.append(
                 f"{len(fails)}/{len(traces)} recent calls failed "
@@ -924,9 +866,7 @@ class AgentCognition:
         reason: str,
         new_steps: list[str] | None = None,
     ) -> dict:
-        """
-        Replace the current plan with a new ordered list of steps.
-        """
+        """Replace the current plan with a new ordered list of steps."""
         task = self.mem.task_get(task_id)
         if not task.get("ok"):
             return {"ok": False, "error": f"unknown task {task_id!r}"}
@@ -956,8 +896,8 @@ class AgentCognition:
         lock = await self._task_lock(task_id)
         async with lock:
             plan_doc = {"steps": cleaned, "cursor": 0, "updated": time.time()}
-            self.mem.fact_set(f"plan:{task_id}", json.dumps(plan_doc, ensure_ascii=False))
-            self.mem.task_step(
+            await self._save_plan(task_id, plan_doc)
+            await self.mem.task_step(
                 task_id,
                 step=f"replan ({len(cleaned)} steps)",
                 ok=True,
@@ -971,9 +911,7 @@ class AgentCognition:
         }
 
     def recover(self, task_id: str) -> dict:
-        """
-        Compose a recovery packet for a stalled or failing task. Read-only.
-        """
+        """Compose a recovery packet for a stalled or failing task. Read-only."""
         task = self.mem.task_get(task_id)
         if not task.get("ok"):
             return {"ok": False, "error": f"unknown task {task_id!r}"}
@@ -1050,7 +988,7 @@ _WORD_RE = re.compile(r"[A-Za-z0-9_]+")
 
 
 def _word_overlap(a: str, b: str) -> float:
-    """Jaccard-ish overlap of word sets — used for plan/subject alignment."""
+    """Jaccard-ish overlap of word sets."""
     sa = {w.lower() for w in _WORD_RE.findall(a or "")}
     sb = {w.lower() for w in _WORD_RE.findall(b or "")}
     if not sa or not sb:
