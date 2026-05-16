@@ -108,31 +108,27 @@ if errorlevel 1 (
 )
 
 :: -------------------------------------------------------------------
-:: 5. Check for Tesseract-OCR binary
+:: 5. Check for Tesseract OCR
 :: -------------------------------------------------------------------
 echo.
-echo ~~ Checking for Tesseract-OCR binary...
-
+echo ~~ Checking for Tesseract OCR
 where tesseract >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo OK: Tesseract found on PATH.
+    echo OK: Tesseract found on PATH
 ) else (
     echo.
-    echo WARN: Tesseract-OCR binary NOT found on PATH.
+    echo WARN: Tesseract OCR binary NOT found on PATH
     echo.
-    echo        OCR tools need the Tesseract binary installed separately.
-    echo        desktop_watch and other desktop tools do NOT need it.
+    echo        OCR tools need Tesseract installed separately
+    echo        desktop_watch and other desktop tools do NOT need it
     echo.
     echo        Install steps:
-    echo          1. Download: github.com/UB-Mannheim/tesseract/wiki
-    echo          2. Run the installer (default location is fine^).
-    echo          3. Add Tesseract to PATH:
-    echo             Start -^> Search "Environment Variables"
-    echo             Edit PATH -^> Add: C:\Program Files\Tesseract-OCR
-    echo          4. Re-run install.bat to verify detection.
+    echo          1. Download from github.com/UB-Mannheim/tesseract/wiki
+    echo          2. Run the installer
+    echo          3. Add Tesseract to PATH in Environment Variables
+    echo          4. Re-run install.bat to verify
     echo.
-    echo        You can skip this and OCR tools will return a helpful
-    echo        error message if called without Tesseract installed.
+    echo        You can skip this. OCR tools will show an error if called.
     echo.
 )
 
@@ -199,7 +195,7 @@ echo    2. Load a model with a local server enabled
 echo    3. Run launch.bat to start Phantom MCP
 echo.
 echo  OPTIONAL (for OCR tools):
-echo    - Install Tesseract-OCR and add to PATH (see warning above)
+echo    - Install Tesseract OCR and add to PATH (see warning above)
 echo.
 echo  Logs will appear in: logs\server_v2.log
 echo ============================================================
