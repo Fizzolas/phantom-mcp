@@ -27,6 +27,16 @@ Pass 7 — OCR + Screen Monitoring:
   * desktop_watch: watches a region for any visual change; no OCR required.
     Use after clicking buttons, typing text, launching apps, or pressing
     Enter — wait for the screen to actually react before the next action.
+
+Pass 8 — Interaction Verification (Phase 3):
+  * desktop_type: added verify=False param; when True, OCR reads back the
+    target region after typing and returns match_ratio + mismatches list.
+  * desktop_click: added verify_change=False param; when True, watches the
+    click region for visual change and returns change_detected boolean.
+  * desktop_key_press: added verify=False param for Enter/Tab/Escape; watches
+    a center region for any screen change after the keypress.
+  * All three now include 'verified: true/false' in result so the agent can
+    detect when an action had no observable effect.
 """
 from __future__ import annotations
 
@@ -40,6 +50,89 @@ from phantom.tools._base import tool
 
 
 MouseButton = Literal["left", "right", "middle"]
+
+
+# ----------------------------------------------------------------------
+# Verification Helpers (Phase 3)
+# ----------------------------------------------------------------------
+async def _verify_typed_text(
+    expected: str,
+    region: str = "full",
+    lang: str = "eng",
+) -> dict:
+    """
+    OCR the region and compare to expected text.
+    Returns {verified: bool, match_ratio: float, mismatches: list[str]}.
+    """
+    try:
+        from tools.pc_vision import ocr_region
+    except ImportError:
+        return {
+            "verified": False,
+            "warning": "OCR verification requires tesseract; install it or pass verify=False.",
+        }
+
+    await asyncio.sleep(0.15)  # let the UI finish rendering the typed text
+    try:
+        ocr_result = await ocr_region(region=region, lang=lang)
+        actual = ocr_result.get("text", "").strip()
+    except Exception as e:
+        return {
+            "verified": False,
+            "error": f"OCR failed: {e}",
+        }
+
+    if not actual:
+        return {
+            "verified": False,
+            "match_ratio": 0.0,
+            "mismatches": ["OCR returned empty string; expected text not visible."],
+        }
+
+    # Simple character-level comparison.
+    expected_clean = expected.strip()
+    matches = sum(1 for a, b in zip(actual, expected_clean) if a == b)
+    total = max(len(actual), len(expected_clean))
+    ratio = matches / total if total > 0 else 0.0
+
+    mismatches = []
+    if ratio < 0.95:
+        mismatches.append(f"Expected: '{expected_clean[:60]}...'")
+        mismatches.append(f"Actual:   '{actual[:60]}...'")
+        if len(actual) < len(expected_clean):
+            mismatches.append(f"Character drop: got {len(actual)} chars, expected {len(expected_clean)}.")
+
+    return {
+        "verified": ratio >= 0.95,
+        "match_ratio": round(ratio, 3),
+        "mismatches": mismatches,
+    }
+
+
+async def _quick_change_check(region: str = "800,400,400,300", threshold: float = 0.01) -> dict:
+    """
+    Watch a region for 400ms to detect any visual change.
+    Returns {change_detected: bool, changed_fraction: float}.
+    Used by desktop_key_press and desktop_click verification.
+    """
+    try:
+        from tools.pc_vision import watch_region_for_change
+    except ImportError:
+        return {"change_detected": False, "warning": "visual verification unavailable"}
+
+    try:
+        watch_result = await watch_region_for_change(
+            region=region,
+            change_threshold=threshold,
+            timeout_s=0.4,
+            poll_s=0.1,
+        )
+        return {
+            "change_detected": watch_result.get("changed", False),
+            "changed_fraction": watch_result.get("changed_fraction", 0.0),
+        }
+    except Exception:
+        return {"change_detected": False}
 
 
 # ----------------------------------------------------------------------
@@ -361,6 +454,13 @@ class MouseClickInput(BaseModel):
         False,
         description="If true, returns a screenshot in the result so you can verify the click landed correctly.",
     )
+    verify_change: bool = Field(
+        False,
+        description=(
+            "If true, watches a 200px square region around the click point for visual change. "
+            "Returns change_detected boolean. Use this to confirm buttons/links actually responded."
+        ),
+    )
 
     model_config = ConfigDict(extra="forbid")
 
@@ -379,6 +479,7 @@ async def desktop_click(
     clicks: int = 1,
     settle_ms: int = 150,
     confirm_screenshot: bool = False,
+    verify_change: bool = False,
 ) -> dict:
     """
     Click at screen coordinate (x, y) then wait for focus to settle.
@@ -394,16 +495,30 @@ async def desktop_click(
 
     To click text you found with desktop_find_text, use the returned
     click_x and click_y values directly as x and y here.
+
+    Phase 3: verify_change=True watches a 200px square region centered on
+    the click point for 400ms and returns change_detected boolean. Use this
+    to confirm a button press or menu click actually had a visual effect.
     """
     from tools.mouse_kb import mouse_click as legacy
     msg = await legacy(x, y, button=button, clicks=clicks, confirm_screenshot=confirm_screenshot)
     if settle_ms > 0:
         await asyncio.sleep(settle_ms / 1000.0)
+
     result = {"x": x, "y": y, "button": button, "clicks": clicks, "settle_ms": settle_ms}
     if isinstance(msg, dict):
         result.update(msg)
     else:
         result["message"] = msg
+
+    if verify_change:
+        region = f"{max(0, x-100)},{max(0, y-100)},200,200"
+        change_check = await _quick_change_check(region=region, threshold=0.01)
+        result["verified"] = change_check["change_detected"]
+        result["changed_fraction"] = change_check.get("changed_fraction", 0.0)
+    else:
+        result["verified"] = False
+
     return ok(result)
 
 
@@ -546,6 +661,21 @@ class KeyboardTypeInput(BaseModel):
             "fast terminals; increase to 0.10 if characters are still dropped."
         ),
     )
+    verify: bool = Field(
+        False,
+        description=(
+            "If true, OCR reads back the target region after typing to confirm text appeared. "
+            "Returns verified, match_ratio, and mismatches list. Requires tesseract."
+        ),
+    )
+    verify_region: str = Field(
+        "full",
+        description="Screen region to OCR for verification. Default 'full' or 'x,y,w,h'.",
+    )
+    verify_lang: str = Field(
+        "eng",
+        description="Tesseract language code for verification OCR.",
+    )
 
     model_config = ConfigDict(extra="forbid")
 
@@ -557,7 +687,13 @@ class KeyboardTypeInput(BaseModel):
     needs=("desktop",),
     timeout_s=45.0,
 )
-async def desktop_type(text: str, interval: float = 0.05) -> dict:
+async def desktop_type(
+    text: str,
+    interval: float = 0.05,
+    verify: bool = False,
+    verify_region: str = "full",
+    verify_lang: str = "eng",
+) -> dict:
     """
     Type text into the currently-focused window.
 
@@ -567,11 +703,15 @@ async def desktop_type(text: str, interval: float = 0.05) -> dict:
          slow apps) OR call desktop_wait (500-1000ms for dialogs/browsers).
       3. Optionally desktop_screenshot to confirm the cursor is in the field.
 
-    VERIFY AFTER TYPING:
-      Use desktop_ocr on the input region to confirm the text appeared
-      correctly. This is faster and more reliable than a screenshot.
-      If the OCR text does not match what you typed, retry with a higher
-      interval or use desktop_hotkey('ctrl+a') to clear first.
+    VERIFY AFTER TYPING (Phase 3):
+      Pass verify=True to automatically OCR the target region after typing
+      and confirm the text appeared. Returns:
+        - verified: true if match_ratio >= 95%
+        - match_ratio: 0.0-1.0 character-level match score
+        - mismatches: list of error messages if text was dropped/garbled
+
+      If OCR returns empty or the match is poor, retry with a higher interval
+      or use desktop_hotkey('ctrl+a') to clear the field first.
 
     Behaviour:
       - Short text with only letters/digits/basic punctuation: typed directly
@@ -584,8 +724,17 @@ async def desktop_type(text: str, interval: float = 0.05) -> dict:
     from tools.mouse_kb import keyboard_type as legacy
     msg = await legacy(text, interval=interval)
     if isinstance(msg, dict):
-        return ok({**msg, "chars": len(text)})
-    return ok({"message": msg, "chars": len(text)})
+        result = {**msg, "chars": len(text)}
+    else:
+        result = {"message": msg, "chars": len(text)}
+
+    if verify:
+        verify_result = await _verify_typed_text(text, region=verify_region, lang=verify_lang)
+        result.update(verify_result)
+    else:
+        result["verified"] = False
+
+    return ok(result)
 
 
 class KeyboardHotkeyInput(BaseModel):
@@ -613,6 +762,13 @@ async def desktop_hotkey(keys: str) -> dict:
 class KeyboardPressInput(BaseModel):
     key: str = Field(..., description="Single key like 'enter', 'escape', 'tab', 'f5'.")
     presses: int = Field(1, ge=1, le=20)
+    verify: bool = Field(
+        False,
+        description=(
+            "If true and key is 'enter', 'tab', or 'escape', watches a center screen region "
+            "for visual change after the keypress. Returns change_detected boolean."
+        ),
+    )
 
     model_config = ConfigDict(extra="forbid")
 
@@ -624,10 +780,26 @@ class KeyboardPressInput(BaseModel):
     needs=("desktop",),
     timeout_s=5.0,
 )
-async def desktop_key_press(key: str, presses: int = 1) -> dict:
+async def desktop_key_press(key: str, presses: int = 1, verify: bool = False) -> dict:
     """
     Press a single key one or more times.
+
+    Phase 3: verify=True watches a 400x300 center region for visual change
+    after the keypress. Use this for Enter, Tab, Escape — keys that trigger
+    UI responses. Returns change_detected boolean.
+
+    If change_detected is false after pressing Enter, the UI may not have
+    accepted the input — check focus or retry.
     """
     from tools.mouse_kb import keyboard_press as legacy
     msg = await legacy(key, presses=presses)
-    return ok({"message": msg, "key": key, "presses": presses})
+    result = {"message": msg, "key": key, "presses": presses}
+
+    if verify and key.lower() in ("enter", "tab", "escape"):
+        change_check = await _quick_change_check()
+        result["verified"] = change_check["change_detected"]
+        result["change_detected"] = change_check["change_detected"]
+    else:
+        result["verified"] = False
+
+    return ok(result)
