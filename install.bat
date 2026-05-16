@@ -112,8 +112,11 @@ if errorlevel 1 (
 :: -------------------------------------------------------------------
 echo.
 echo ~~ Checking for Tesseract-OCR binary...
-where tesseract >nul 2>&1
-if errorlevel 1 (
+
+where tesseract >nul 2>nul
+if %ERRORLEVEL% EQU 0 (
+    echo OK: Tesseract found on PATH.
+) else (
     echo.
     echo WARN: Tesseract-OCR binary NOT found on PATH.
     echo.
@@ -122,7 +125,7 @@ if errorlevel 1 (
     echo.
     echo        Install steps:
     echo          1. Download: github.com/UB-Mannheim/tesseract/wiki
-    echo          2. Run the installer (default location is fine).
+    echo          2. Run the installer (default location is fine^).
     echo          3. Add Tesseract to PATH:
     echo             Start -^> Search "Environment Variables"
     echo             Edit PATH -^> Add: C:\Program Files\Tesseract-OCR
@@ -131,8 +134,6 @@ if errorlevel 1 (
     echo        You can skip this and OCR tools will return a helpful
     echo        error message if called without Tesseract installed.
     echo.
-) else (
-    echo OK: Tesseract found on PATH.
 )
 
 :: -------------------------------------------------------------------
