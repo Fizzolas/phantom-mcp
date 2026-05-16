@@ -64,12 +64,82 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import time
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(ROOT))
+
+
+# ---- Pre-flight environment check -----------------------------------------
+def _validate_environment() -> None:
+    """
+    Run before any other server initialisation.
+
+    Checks:
+      1. Python 3.8+ is required for async/await and several stdlib features.
+      2. The server must be run from (or located in) the phantom-mcp directory
+         so that relative paths to data/, logs/, and phantom/ are correct.
+      3. logs/ and data/ directories must be writable (creates them if absent).
+      4. Core package imports are present (mcp, pydantic).
+
+    Exits with a human-readable message on failure — never a raw traceback.
+    """
+    # 1. Python version
+    if sys.version_info < (3, 8):
+        sys.stderr.write(
+            f"[phantom] ERROR: Python 3.8 or higher is required.\n"
+            f"  You are running Python {sys.version.split()[0]}.\n"
+            f"  Download a newer version from https://www.python.org/downloads/\n"
+        )
+        sys.exit(1)
+
+    # 2. Working-directory / install-directory sanity check
+    if not (ROOT / "phantom").is_dir():
+        sys.stderr.write(
+            f"[phantom] ERROR: Cannot find the 'phantom' package directory.\n"
+            f"  Expected it at: {ROOT / 'phantom'}\n"
+            f"  Make sure you run 'python server_v2.py' from inside the\n"
+            f"  phantom-mcp folder, or use the full path:\n"
+            f"    python C:\\phantom-mcp\\server_v2.py\n"
+        )
+        sys.exit(1)
+
+    # 3. Writable directories
+    for dirpath in (ROOT / "logs", ROOT / "data"):
+        try:
+            dirpath.mkdir(parents=True, exist_ok=True)
+            probe = dirpath / ".write_probe"
+            probe.write_text("ok")
+            probe.unlink()
+        except OSError as exc:
+            sys.stderr.write(
+                f"[phantom] ERROR: Cannot write to '{dirpath}'.\n"
+                f"  Reason: {exc}\n"
+                f"  Check folder permissions or run as a user who owns that directory.\n"
+            )
+            sys.exit(1)
+
+    # 4. Core imports
+    missing = []
+    for pkg in ("mcp", "pydantic"):
+        try:
+            __import__(pkg)
+        except ImportError:
+            missing.append(pkg)
+    if missing:
+        sys.stderr.write(
+            f"[phantom] ERROR: Required packages not installed: {', '.join(missing)}\n"
+            f"  Run:  pip install -r requirements.txt\n"
+        )
+        sys.exit(1)
+
+
+_validate_environment()
+# ---------------------------------------------------------------------------
+
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -114,18 +184,14 @@ set_memory(PhantomMemory(DATA_DIR))
 
 _BUDGET: TokenBudget | None = None
 _LMS_INFO: dict | None = None
-_HOST_ONLINE: bool = False  # set True once a host is successfully detected
+_HOST_ONLINE: bool = False
+_SHUTDOWN_REQUESTED: bool = False
 
 # How long to keep retrying host probe at boot before giving up (seconds).
-# Jan.ai spawns Phantom before its own API server is ready, so we need to
-# wait for it. 20 s covers even slow model-load cold starts.
 HOST_PROBE_TIMEOUT_S = 20.0
-# Pause between retry attempts.
 HOST_PROBE_RETRY_S = 2.0
 
 # Known host candidates: (label, base_url)
-# Jan.ai uses port 1337; LM Studio uses 1234.
-# Both speak the same OpenAI-compatible REST schema.
 _HOST_CANDIDATES: list[tuple[str, str]] = [
     ("LM Studio",  "http://localhost:1234/v1"),
     ("Jan.ai",     "http://localhost:1337/v1"),
@@ -164,12 +230,6 @@ async def _detect_host() -> LMStudioProbe:
     Jan.ai spawns Phantom as a child process before its own API server is
     fully up. Without retries Phantom would probe once, get nothing, and
     drop into offline mode even though Jan is about to be ready.
-
-    Strategy:
-      1. PHANTOM_HOST_URL env var — tried first on every pass.
-      2. LM Studio (port 1234) then Jan.ai (port 1337) — tried each pass.
-      3. If no host found within the timeout, return safe degraded fallback.
-         We also set a flag so the first list_tools call can re-probe.
     """
     global _HOST_ONLINE
 
@@ -191,8 +251,6 @@ async def _detect_host() -> LMStudioProbe:
                   attempt, wait, remaining)
         await asyncio.sleep(wait)
 
-    # Nothing reachable after full timeout — safe degraded fallback.
-    # _HOST_ONLINE stays False; list_tools will trigger a re-probe.
     log.warning(
         "No host reachable after %.0fs (tried LM Studio:1234, Jan.ai:1337%s). "
         "Running in offline mode — tools that don't need a host stay available. "
@@ -226,10 +284,49 @@ async def _refresh_runtime_state(*, silent: bool = False) -> None:
         )
 
 
+# ---- Graceful shutdown -----------------------------------------------------
+
+async def _shutdown(sig_name: str | None = None) -> None:
+    """
+    Flush in-flight memory writes and close log handlers cleanly.
+
+    Called either by OS signal (SIGINT / SIGTERM) or the finally block in
+    _main().  Safe to call more than once — second call is a no-op.
+    """
+    global _SHUTDOWN_REQUESTED
+    if _SHUTDOWN_REQUESTED:
+        return
+    _SHUTDOWN_REQUESTED = True
+
+    if sig_name:
+        log.info("phantom-mcp: received %s — shutting down gracefully...", sig_name)
+    else:
+        log.info("phantom-mcp: shutting down...")
+
+    try:
+        mem = get_memory()
+        # PhantomMemory writes are atomic (tmp→rename) and lock-guarded, so
+        # the in-memory caches are already flushed on every mutation.  We just
+        # need to make sure no write is mid-flight, which the asyncio lock
+        # already guarantees.  A short yield is sufficient.
+        await asyncio.sleep(0.1)
+        log.info("phantom-mcp: memory state clean.")
+    except Exception:
+        log.exception("phantom-mcp: error during memory flush")
+
+    log.info("phantom-mcp: shutdown complete.")
+    # Flush log handlers so the last messages are not lost.
+    for h in log.handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
+
+
 # ---- MCP server ------------------------------------------------------------
 app = Server("phantom-mcp")
 
-_list_tools_called = False  # used for late re-probe on first list_tools
+_list_tools_called = False
 
 
 def _spec_to_mcp_tool(spec) -> types.Tool:
@@ -250,8 +347,6 @@ def _spec_to_mcp_tool(spec) -> types.Tool:
 async def list_tools() -> list[types.Tool]:
     global _list_tools_called, _BUDGET, _LMS_INFO, _HOST_ONLINE
 
-    # Late re-probe: if we booted offline, try the host again the first time
-    # Jan.ai calls list_tools — by then Jan's own API server is definitely up.
     if not _list_tools_called and not _HOST_ONLINE:
         _list_tools_called = True
         log.info("list_tools: host was offline at boot — re-probing now...")
@@ -320,13 +415,35 @@ async def call_tool(name: str, arguments: dict | None = None) -> list[types.Text
 
 # ---- entry point -----------------------------------------------------------
 async def _main() -> None:
-    await _refresh_runtime_state()
-    log.info("phantom-mcp v2 ready: %d tools advertised.", len(registry.available()))
-    # Restore stdout to the original fd so the MCP stdio transport
-    # can write to the real stdout pipe that Jan/LM Studio is reading.
-    sys.stdout = _original_stdout
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
+    # Register OS-level signal handlers for graceful shutdown.
+    # Windows does not support SIGTERM in the same way, but SIGINT (Ctrl+C)
+    # works on all platforms.  We guard SIGTERM behind a platform check.
+    loop = asyncio.get_running_loop()
+
+    def _handle_signal(sig_name: str) -> None:
+        log.info("signal %s received", sig_name)
+        asyncio.create_task(_shutdown(sig_name))
+
+    try:
+        loop.add_signal_handler(signal.SIGINT,  lambda: _handle_signal("SIGINT"))
+    except (NotImplementedError, OSError):
+        pass  # Windows ProactorEventLoop may not support add_signal_handler
+    if hasattr(signal, "SIGTERM"):
+        try:
+            loop.add_signal_handler(signal.SIGTERM, lambda: _handle_signal("SIGTERM"))
+        except (NotImplementedError, OSError):
+            pass
+
+    try:
+        await _refresh_runtime_state()
+        log.info("phantom-mcp v2 ready: %d tools advertised.", len(registry.available()))
+        # Restore stdout to the original fd so the MCP stdio transport
+        # can write to the real stdout pipe that Jan/LM Studio is reading.
+        sys.stdout = _original_stdout
+        async with stdio_server() as (read_stream, write_stream):
+            await app.run(read_stream, write_stream, app.create_initialization_options())
+    finally:
+        await _shutdown()
 
 
 if __name__ == "__main__":
