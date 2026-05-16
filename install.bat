@@ -1,5 +1,5 @@
 @echo off
-setlocal enabledelayedexpansion
+setlocal
 
 echo ============================================================
 echo  Phantom MCP -- Installer
