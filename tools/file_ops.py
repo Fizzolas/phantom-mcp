@@ -4,26 +4,35 @@ read_file caps output at MAX_READ_CHARS to prevent context overflow.
 Agents can write/delete files they created freely; user files require auth_guard approval.
 
 FIX (sweep-2):
-  - search_files: Path.rglob() follows symlinks and can loop forever on Windows
-    AppData junctions. Now tracks visited real paths (via os.stat st_ino+st_dev)
-    to detect and skip circular symlinks, plus the depth cap that was already described
-    in the docstring but not actually implemented.
-  - list_dir: PermissionError on individual entries (common in system folders)
-    now skipped gracefully instead of crashing the whole listing.
-  - read_file: binary file detection — returns a clear error instead of a
-    garbled UnicodeDecodeError when the agent accidentally tries to read an exe/zip.
+  - search_files: symlink loop detection via visited inodes + depth cap.
+  - list_dir: PermissionError on individual entries skipped gracefully.
+  - read_file: binary file detection.
 
 FIX (sweep-4):
-  - read_dir_tree: truncation string had literal embedded newlines (SyntaxError).
-    Replaced with proper \n escape sequences.
+  - read_dir_tree: truncation string used literal embedded newlines (SyntaxError).
+
+FIX (PART 2):
+  - write_file: now writes atomically via a .tmp sibling then renames.
+    A crash mid-write can no longer leave a partial/corrupt file.
+  - append_file: wrapped in asyncio.to_thread to avoid blocking the event
+    loop on large appends.
+  - delete_file: path traversal guard added. Absolute paths that point
+    outside the server root (e.g. ../../Windows/System32) are rejected.
+  - write_file: rejects writes larger than MAX_WRITE_CHARS (1 MB) so a
+    runaway model can't fill the disk in one call.
 """
 import asyncio
 import os
+import tempfile
 from pathlib import Path
 
-MAX_READ_CHARS = 12000
+MAX_READ_CHARS = 12_000
+MAX_WRITE_CHARS = 1_000_000   # 1 MB hard cap per write call
 MAX_SEARCH_DEPTH = 20
 MAX_SEARCH_RESULTS = 200
+
+# Server root — delete_file rejects paths that escape this tree.
+_SERVER_ROOT = Path(__file__).resolve().parent.parent
 
 # Common binary extensions — return a clear error instead of garbage
 _BINARY_EXTS = {
@@ -52,7 +61,6 @@ async def read_file(path: str) -> dict:
             return {"error": f"File not found: {path}"}
         if not p.is_file():
             return {"error": f"Path is not a file: {path}"}
-        # FIX: bail early on known binary formats
         if p.suffix.lower() in _BINARY_EXTS:
             return {
                 "error": f"Binary file detected ({p.suffix}). Cannot read as text.",
@@ -73,22 +81,60 @@ async def read_file(path: str) -> dict:
 
 
 async def write_file(path: str, content: str) -> dict:
-    try:
+    """
+    Overwrite a file atomically: write to a .tmp sibling first, then
+    rename into place. A crash mid-write can never leave a corrupt file.
+
+    PART 2: rejects content larger than MAX_WRITE_CHARS (1 MB).
+    """
+    if len(content) > MAX_WRITE_CHARS:
+        return {
+            "error": (
+                f"write_file: content too large ({len(content):,} chars, "
+                f"limit {MAX_WRITE_CHARS:,}). "
+                "Split into smaller chunks or stream via shell_cmd."
+            )
+        }
+
+    def _do_write():
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
+        # Write to a sibling .tmp file then rename atomically.
+        fd, tmp_path = tempfile.mkstemp(
+            dir=p.parent,
+            prefix=f".{p.name}.",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, str(p))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         return {"ok": True, "path": str(p.resolve()), "bytes_written": len(content.encode())}
+
+    try:
+        return await asyncio.to_thread(_do_write)
     except Exception as e:
         return {"error": str(e)}
 
 
 async def append_file(path: str, content: str) -> dict:
-    try:
+    def _do_append():
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as f:
             f.write(content)
         return {"ok": True, "path": str(p.resolve()), "bytes_appended": len(content.encode())}
+
+    try:
+        return await asyncio.to_thread(_do_append)
     except Exception as e:
         return {"error": str(e)}
 
@@ -104,8 +150,6 @@ async def list_dir(path: str) -> dict:
                 entries.append({
                     "name": item.name,
                     "type": "dir" if item.is_dir() else "file",
-                    # FIX: wrap stat() so a PermissionError on one entry
-                    # doesn't kill the entire directory listing
                     "size_bytes": item.stat().st_size if item.is_file() else None,
                 })
             except (PermissionError, OSError):
@@ -116,16 +160,38 @@ async def list_dir(path: str) -> dict:
 
 
 async def delete_file(path: str) -> dict:
+    """
+    Delete a file or directory.
+
+    PART 2: path traversal guard. Rejects any resolved path that escapes
+    _SERVER_ROOT (e.g. ../../Windows/System32 attacks). The model can only
+    delete files inside the phantom-mcp folder tree.
+    """
     def _do_delete():
         import shutil
-        p = Path(path)
+        p = Path(path).resolve()
+
+        # Path traversal guard.
+        try:
+            p.relative_to(_SERVER_ROOT)
+        except ValueError:
+            return {
+                "error": (
+                    f"delete_file: path '{path}' resolves outside the Phantom "
+                    f"server root ({_SERVER_ROOT}). Deletion of system or user "
+                    "files outside the project tree is not permitted."
+                ),
+                "hint": "Only files inside the phantom-mcp folder can be deleted.",
+            }
+
         if not p.exists():
             return {"error": f"Not found: {path}"}
         if p.is_dir():
             shutil.rmtree(p)
         else:
             p.unlink()
-        return {"ok": True, "deleted": str(p.resolve())}
+        return {"ok": True, "deleted": str(p)}
+
     try:
         return await asyncio.to_thread(_do_delete)
     except Exception as e:
@@ -143,12 +209,6 @@ def file_exists(path: str) -> dict:
 
 
 async def search_files(root: str, pattern: str) -> dict:
-    """
-    FIX (sweep-2): The depth-limit in the previous version only checked
-    path component count — it did NOT detect circular symlinks (Windows junction
-    loops have the same depth as normal paths). Now we also track visited
-    (st_ino, st_dev) pairs to detect and break loops.
-    """
     def _search():
         p = Path(root)
         if not p.exists():
@@ -159,10 +219,8 @@ async def search_files(root: str, pattern: str) -> dict:
 
         try:
             for f in p.rglob(pattern):
-                # Depth check
                 if len(f.parts) - root_depth > MAX_SEARCH_DEPTH:
                     continue
-                # Symlink loop detection
                 try:
                     st = os.stat(f)
                     inode_key = (st.st_ino, st.st_dev)
@@ -185,24 +243,6 @@ async def search_files(root: str, pattern: str) -> dict:
 
 
 def read_dir_tree(root: str, pattern: str = "**/*", max_files: int = 10) -> dict:
-    """
-    List all entries under `root` matching `pattern` and return the text
-    contents of up to `max_files` matching files in one call.
-
-    Use instead of list_dir + multiple read_file calls when you need to
-    understand the full contents of a folder in one step.
-
-    Returns:
-      ok        : bool
-      root      : resolved root path
-      pattern   : glob pattern used
-      tree      : list of {path, type, size?} for every entry
-      contents  : {relative_path: text} for up to max_files readable files
-      _hint     : model guidance hint
-
-    FIX (sweep-4): truncation string used literal embedded newlines which
-    caused a SyntaxError on import. Now uses proper escape sequences.
-    """
     base = Path(root)
     if not base.exists():
         return {"ok": False, "error": f"Root not found: {root}"}
