@@ -15,8 +15,12 @@ What changed vs server.py:
     repeated failures into lessons the model can read at boot.
   * Host detection: at boot we probe for LM Studio, Jan.ai, and any
     generic OpenAI-compatible server. The first reachable one wins and
-    sizes the token budget. If none are found we fall back to 8k context
-    and keep running — all tools that don't need the host stay available.
+    sizes the token budget. If none are found we retry for up to
+    HOST_PROBE_TIMEOUT_S seconds (handles Jan.ai cold-start where the
+    API server isn't ready when Phantom is spawned). If still unreachable
+    we fall back to 8k context and keep running — all tools that don't
+    need the host stay available, and we re-probe on the first list_tools
+    call so the budget is corrected the moment the host comes up.
 
 STDIO SAFETY NOTE
 -----------------
@@ -110,6 +114,14 @@ set_memory(PhantomMemory(DATA_DIR))
 
 _BUDGET: TokenBudget | None = None
 _LMS_INFO: dict | None = None
+_HOST_ONLINE: bool = False  # set True once a host is successfully detected
+
+# How long to keep retrying host probe at boot before giving up (seconds).
+# Jan.ai spawns Phantom before its own API server is ready, so we need to
+# wait for it. 20 s covers even slow model-load cold starts.
+HOST_PROBE_TIMEOUT_S = 20.0
+# Pause between retry attempts.
+HOST_PROBE_RETRY_S = 2.0
 
 # Known host candidates: (label, base_url)
 # Jan.ai uses port 1337; LM Studio uses 1234.
@@ -120,33 +132,21 @@ _HOST_CANDIDATES: list[tuple[str, str]] = [
 ]
 
 
-async def _detect_host() -> LMStudioProbe:
+async def _try_hosts_once() -> LMStudioProbe | None:
     """
-    Try hosts in order and return the first reachable one.
-
-    Priority:
-      1. PHANTOM_HOST_URL env var (explicit override — always tried first).
-      2. LM Studio  (port 1234)
-      3. Jan.ai     (port 1337)
-      4. Safe fallback probe (reachable=False, 8k context).
-
-    The probe uses probe_lmstudio() which already handles SDK vs REST
-    fallback and caching — we just feed it different base_url values.
+    Make a single pass over all host candidates (and the env-var override).
+    Returns the first reachable probe, or None if nothing is up yet.
     """
-    # 1. Explicit override from environment.
     override_url = os.environ.get("PHANTOM_HOST_URL", "").strip()
     if override_url:
-        log.info("host detection: PHANTOM_HOST_URL override → %s", override_url)
         result = await probe_lmstudio(base_url=override_url, force=True)
         if result.reachable:
-            log.info("host detected via override: %s (model=%s ctx=%s)",
+            log.info("host detected via PHANTOM_HOST_URL override: %s (model=%s ctx=%s)",
                      override_url, result.model_id, result.context_length)
             return result
-        log.warning("PHANTOM_HOST_URL=%s is not reachable: %s", override_url, result.error)
+        log.debug("override probe miss: %s → %s", override_url, result.error)
 
-    # 2. Auto-detect from candidate list.
-    candidates = list(_HOST_CANDIDATES)
-    for label, url in candidates:
+    for label, url in _HOST_CANDIDATES:
         result = await probe_lmstudio(base_url=url, force=True)
         if result.reachable:
             log.info("host detected: %s at %s (model=%s ctx=%s tools=%s)",
@@ -154,12 +154,52 @@ async def _detect_host() -> LMStudioProbe:
             return result
         log.debug("host probe miss: %s (%s) → %s", label, url, result.error)
 
-    # 3. Nothing reachable — safe degraded fallback.
+    return None
+
+
+async def _detect_host() -> LMStudioProbe:
+    """
+    Try hosts repeatedly for up to HOST_PROBE_TIMEOUT_S seconds.
+
+    Jan.ai spawns Phantom as a child process before its own API server is
+    fully up. Without retries Phantom would probe once, get nothing, and
+    drop into offline mode even though Jan is about to be ready.
+
+    Strategy:
+      1. PHANTOM_HOST_URL env var — tried first on every pass.
+      2. LM Studio (port 1234) then Jan.ai (port 1337) — tried each pass.
+      3. If no host found within the timeout, return safe degraded fallback.
+         We also set a flag so the first list_tools call can re-probe.
+    """
+    global _HOST_ONLINE
+
+    deadline = time.monotonic() + HOST_PROBE_TIMEOUT_S
+    attempt = 0
+
+    while time.monotonic() < deadline:
+        attempt += 1
+        probe = await _try_hosts_once()
+        if probe is not None:
+            _HOST_ONLINE = True
+            return probe
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        wait = min(HOST_PROBE_RETRY_S, remaining)
+        log.debug("host not ready yet (attempt %d), retrying in %.1fs (%.0fs left)...",
+                  attempt, wait, remaining)
+        await asyncio.sleep(wait)
+
+    # Nothing reachable after full timeout — safe degraded fallback.
+    # _HOST_ONLINE stays False; list_tools will trigger a re-probe.
     log.warning(
-        "No host reachable (tried LM Studio:1234, Jan.ai:1337%s). "
+        "No host reachable after %.0fs (tried LM Studio:1234, Jan.ai:1337%s). "
         "Running in offline mode — tools that don't need a host stay available. "
+        "Will re-probe on first tool listing. "
         "Set PHANTOM_HOST_URL env var if your host is on a non-standard port.",
-        f", override={override_url}" if override_url else "",
+        HOST_PROBE_TIMEOUT_S,
+        f", override={os.environ.get('PHANTOM_HOST_URL', '').strip()}" if os.environ.get("PHANTOM_HOST_URL") else "",
     )
     return LMStudioProbe(
         reachable=False,
@@ -168,39 +208,28 @@ async def _detect_host() -> LMStudioProbe:
     )
 
 
-async def _refresh_runtime_state() -> None:
+async def _refresh_runtime_state(*, silent: bool = False) -> None:
     """Probe capabilities + host; size the budget for the loaded model."""
-    global _BUDGET, _LMS_INFO
+    global _BUDGET, _LMS_INFO, _HOST_ONLINE
 
     caps = probe_capabilities()
     registry.set_capabilities(caps)
 
     host_probe = await _detect_host()
+    _HOST_ONLINE = host_probe.reachable
     _LMS_INFO = host_probe.as_dict()
     _BUDGET = TokenBudget(context_length=host_probe.context_length)
-    log.info(
-        "boot: capabilities=%s host_reachable=%s model=%s ctx=%s",
-        sorted(caps), host_probe.reachable, host_probe.model_id, host_probe.context_length,
-    )
+    if not silent:
+        log.info(
+            "boot: capabilities=%s host_reachable=%s model=%s ctx=%s",
+            sorted(caps), host_probe.reachable, host_probe.model_id, host_probe.context_length,
+        )
 
 
 # ---- MCP server ------------------------------------------------------------
 app = Server("phantom-mcp")
 
-
-class _OnceFilter(logging.Filter):
-    def __init__(self) -> None:
-        super().__init__()
-        self._fired = False
-
-    def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
-        if self._fired:
-            return False
-        self._fired = True
-        return True
-
-
-_list_tools_once = _OnceFilter()
+_list_tools_called = False  # used for late re-probe on first list_tools
 
 
 def _spec_to_mcp_tool(spec) -> types.Tool:
@@ -219,13 +248,29 @@ def _spec_to_mcp_tool(spec) -> types.Tool:
 
 @app.list_tools()
 async def list_tools() -> list[types.Tool]:
+    global _list_tools_called, _BUDGET, _LMS_INFO, _HOST_ONLINE
+
+    # Late re-probe: if we booted offline, try the host again the first time
+    # Jan.ai calls list_tools — by then Jan's own API server is definitely up.
+    if not _list_tools_called and not _HOST_ONLINE:
+        _list_tools_called = True
+        log.info("list_tools: host was offline at boot — re-probing now...")
+        probe = await _try_hosts_once()
+        if probe is not None:
+            _HOST_ONLINE = True
+            _LMS_INFO = probe.as_dict()
+            _BUDGET = TokenBudget(context_length=probe.context_length)
+            log.info(
+                "late host detect: %s (model=%s ctx=%s tools=%s)",
+                probe.base_url, probe.model_id, probe.context_length, probe.supports_tools,
+            )
+        else:
+            log.warning("list_tools re-probe: still no host reachable. Staying in offline mode.")
+    else:
+        _list_tools_called = True
+
     available = registry.available()
-    _once_log = logging.getLogger("phantom.list_tools.once")
-    if not _once_log.filters:
-        _once_log.addFilter(_list_tools_once)
-    _once_log.info(
-        "list_tools: %d tools advertised (of %d total)", len(available), len(registry.all())
-    )
+    log.info("list_tools: %d tools advertised (of %d total)", len(available), len(registry.all()))
     return [_spec_to_mcp_tool(s) for s in available]
 
 
