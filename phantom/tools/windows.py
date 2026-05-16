@@ -4,6 +4,10 @@ phantom.tools.windows — list/focus/move/size desktop windows.
 Wraps tools/window_ops.py. needs=("desktop",) so headless boxes hide
 these. Each tool returns dict with predictable shape; failures include
 available_titles to help the model retry.
+
+Phase 3:
+  * window_focus now verifies the focus change by calling window_active()
+    after the legacy focus call and checking the active window title matches.
 """
 from __future__ import annotations
 
@@ -58,11 +62,21 @@ async def window_list() -> dict:
 @tool("window_focus", category="windows", schema=WindowTitleInput, needs=("desktop",), timeout_s=10.0)
 async def window_focus(title: str, strict: bool = False) -> dict:
     """
-    Bring a window to the foreground. With strict=False, matches by
-    case-insensitive substring; on failure returns available_titles so the
-    model can retry with a better title.
+    Bring a window to the foreground and verify focus succeeded.
+
+    With strict=False, matches by case-insensitive substring; on failure
+    returns available_titles so the model can retry with a better title.
+
+    Phase 3: after calling the legacy focus function, immediately calls
+    window_active() to confirm the requested window is now focused.
+    Returns verified: true/false.
+
+    If verified is false, the legacy focus call may have succeeded but
+    another window stole focus immediately afterward, or the OS blocked
+    the focus change (common on Windows 10/11 when the calling process
+    is in the background).
     """
-    from tools.window_ops import focus_window as legacy
+    from tools.window_ops import focus_window as legacy, get_active_window
     result = await legacy(title, strict=strict)
     if isinstance(result, dict) and not result.get("ok", False):
         return fail(
@@ -71,6 +85,18 @@ async def window_focus(title: str, strict: bool = False) -> dict:
             category="client_error",
             available_titles=result.get("available_titles", []),
         )
+
+    # Verify the focus change by reading back the active window.
+    active = get_active_window()
+    focused_title = result.get("focused", "")
+    actual_title = active.get("title", "")
+
+    if actual_title and focused_title and focused_title.lower() in actual_title.lower():
+        result["verified"] = True
+    else:
+        result["verified"] = False
+        result["warning"] = f"Focus call succeeded but active window is '{actual_title}', not '{focused_title}'."
+
     return ok(result)
 
 
