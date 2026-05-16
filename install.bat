@@ -47,7 +47,7 @@ if %PYMAJ% EQU 3 if %PYMIN% LSS 8 (
 :: 1. Create virtual environment
 :: -------------------------------------------------------------------
 if not exist .venv (
-    echo [..] Creating virtual environment...
+    echo [...] Creating virtual environment...
     python -m venv .venv
     if errorlevel 1 (
         echo [ERROR] Failed to create .venv
@@ -64,7 +64,7 @@ if not exist .venv (
 :: 2. Activate + upgrade pip
 :: -------------------------------------------------------------------
 call .venv\Scripts\activate.bat
-echo [..] Upgrading pip...
+echo [...] Upgrading pip...
 python -m pip install --upgrade pip --quiet
 echo [OK] pip up to date
 
@@ -76,7 +76,7 @@ echo [OK] Saved python path to .python_cmd.txt
 :: 3. Install CORE requirements first (always works; minimal deps)
 :: -------------------------------------------------------------------
 echo.
-echo [..] Installing CORE requirements (requirements-core.txt)...
+echo [...] Installing CORE requirements (requirements-core.txt)...
 echo      (mcp, pydantic, httpx, python-dotenv)
 pip install -r requirements-core.txt
 if errorlevel 1 (
@@ -92,7 +92,7 @@ echo [OK] Core requirements installed
 :: 4. Install FULL requirements (optional heavy deps)
 :: -------------------------------------------------------------------
 echo.
-echo [..] Installing full requirements (requirements.txt)...
+echo [...] Installing full requirements (requirements.txt)...
 echo      This includes desktop automation, OCR, vision, and web tools.
 echo      Some packages are large. This may take several minutes.
 pip install -r requirements.txt --quiet
@@ -111,7 +111,7 @@ if errorlevel 1 (
 :: 5. Check for Tesseract-OCR binary
 :: -------------------------------------------------------------------
 echo.
-echo [..] Checking for Tesseract-OCR binary...
+echo [...] Checking for Tesseract-OCR binary...
 where tesseract >nul 2>&1
 if errorlevel 1 (
     echo.
@@ -139,7 +139,7 @@ if errorlevel 1 (
 :: 6. Create required data directories
 :: -------------------------------------------------------------------
 echo.
-echo [..] Creating data directories...
+echo [...] Creating data directories...
 if not exist memory mkdir memory
 if not exist logs   mkdir logs
 if not exist data   mkdir data
@@ -150,7 +150,7 @@ echo [OK] Directories ready (memory, logs, data, data\phantom_memory)
 :: 7. Run server startup validation (checks Python version, paths, etc.)
 :: -------------------------------------------------------------------
 echo.
-echo [..] Running startup validation check...
+echo [...] Running startup validation check...
 python -c "import sys; sys.path.insert(0,'.'); exec(open('server_v2.py').read().split('from mcp')[0])" >nul 2>&1
 if errorlevel 1 (
     echo [WARN] Validation check returned warnings. Check logs\server_v2.log after first run.
@@ -162,7 +162,7 @@ if errorlevel 1 (
 :: 8. Check for reachable AI host (LM Studio or Jan.ai)
 :: -------------------------------------------------------------------
 echo.
-echo [..] Checking for AI host (LM Studio port 1234, Jan.ai port 1337)...
+echo [...] Checking for AI host (LM Studio port 1234, Jan.ai port 1337)...
 
 set HOST_FOUND=0
 
@@ -194,7 +194,7 @@ echo  Installation complete!
 echo.
 echo  NEXT STEPS:
 echo    1. Start LM Studio (port 1234) OR Jan.ai (port 1337)
-    echo    2. Load a model with a local server enabled
+echo    2. Load a model with a local server enabled
 echo    3. Run launch.bat to start Phantom MCP
 echo.
 echo  OPTIONAL (for OCR tools):
