@@ -10,6 +10,7 @@ from phantom.tools._base import tool, registry, ToolRegistry, ToolSpec, _safe_im
 
 # Pure-Python / cheap imports first
 _safe_import_tool_module("phantom.tools.memory")
+_safe_import_tool_module("phantom.tools.skills")     # Ouro self-improving skill layer
 _safe_import_tool_module("phantom.tools.cognition")
 _safe_import_tool_module("phantom.tools.pc_info")
 _safe_import_tool_module("phantom.tools.clipboard")
