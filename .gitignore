@@ -5,14 +5,35 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
-# Phantom runtime
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Phantom runtime data (never commit user memory)
 data/memory.json
 data/phantom_memory/
 logs/
-logs/*.log
-logs/*.jsonl
+
+# Atomic write temp files (should never be committed mid-write)
+*.tmp
+*.jsonl.tmp
+*.json.tmp
+
+# Corrupt file backups created by memory recovery
+*.corrupt.*
+
+# Install helper
+.python_cmd.txt
 
 # Editors
 .vscode/
 .idea/
 *.swp
+*.swo
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
