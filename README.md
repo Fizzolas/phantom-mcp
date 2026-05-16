@@ -1,6 +1,6 @@
 # 👻 Phantom MCP Server
 
-**Desktop-control MCP server for LM Studio. Your model gets eyes,
+**Desktop-control MCP server for LM Studio and Jan.ai. Your model gets eyes,
 hands, a shell, durable memory, and self-learning.**
 
 > Need step-by-step setup? Read [`docs/getting-started.md`](docs/getting-started.md).
@@ -15,15 +15,15 @@ hands, a shell, durable memory, and self-learning.**
 ## What this is
 
 Phantom is a [Model Context Protocol](https://modelcontextprotocol.io)
-server that gives the LLM you've loaded in LM Studio the tools it needs
+server that gives the LLM you've loaded in LM Studio or Jan.ai the tools it needs
 to actually do things on your machine. The model still talks to you in
-LM Studio's chat box — phantom is the model's hands, not a separate UI.
+the chat box — phantom is the model's hands, not a separate UI.
 
 ### Mind / Body model
 
 Phantom is built around a simple split:
 
-- **LM Studio is the mind.** It holds the conversation, plans, reasons,
+- **LM Studio / Jan.ai is the mind.** It holds the conversation, plans, reasons,
   writes language, and chooses which tool to call next.
 - **Phantom is the body.** It perceives (screenshots, OCR, file reads),
   acts (clicks, keystrokes, shell commands, file writes), remembers
@@ -31,7 +31,7 @@ Phantom is built around a simple split:
   scaffolding (`agent_*` tools) for self-checking before it acts.
 
 Phantom does not run on its own. Every tool call originates from the
-mind in LM Studio, including the cognition tools — there is no hidden
+mind in LM Studio or Jan.ai, including the cognition tools — there is no hidden
 background loop. The cognition layer is there so a small local model
 does not have to reinvent goal tracking, planning, risk-checking, and
 self-reflection from scratch on every turn.
@@ -46,11 +46,11 @@ self-reflection from scratch on every turn.
 | 💻 Shell           | `shell_cmd`, `shell_powershell`, `shell_python`                       |
 | 📁 Files           | `file_read`, `file_write`, `file_list_dir`, `file_search`, `file_read_tree` |
 | 🧠 Memory          | `memory_fact_*`, `memory_task_*`, `memory_trace_*`, `memory_lesson_*`, `memory_note_*` |
-| 🪞 Cognition       | `agent_goal_start`, `agent_understand`, `agent_plan_set`, `agent_plan_advance`, `agent_next_action`, `agent_status`, `agent_reflect`, `agent_action_review`, `agent_confidence_check`, `agent_risk_check`, `agent_checkpoint`, `agent_after_action_review`, `agent_stuck_detect`, `agent_replan`, `agent_recover` |
+| 🪹 Cognition       | `agent_goal_start`, `agent_understand`, `agent_plan_set`, `agent_plan_advance`, `agent_next_action`, `agent_status`, `agent_reflect`, `agent_action_review`, `agent_confidence_check`, `agent_risk_check`, `agent_checkpoint`, `agent_after_action_review`, `agent_stuck_detect`, `agent_replan`, `agent_recover` |
 | 🔬 PC info         | `system_info`                                                         |
 | 📋 Clipboard       | `clipboard_get`, `clipboard_set`                                      |
 | 🔔 Notifications   | `notify_user`                                                         |
-| 🌐 Web             | `web_search` (needs Playwright)                                       |
+| 🌐 Web             | `web_search` (needs Playwright + `python -m playwright install chromium`) |
 
 Tool names are deliberately namespaced (`desktop_*`, `memory_*`, etc.)
 so the model never confuses them with another MCP server's tools.
@@ -68,10 +68,10 @@ so the model never confuses them with another MCP server's tools.
 | No record of what the model had been doing              | Every tool call is auto-traced with outcome and latency.                                                           |
 | No way to learn from past failures                      | `memory_learn_from_traces` distills repeated failures into "lessons" the model can read.                            |
 | Names like `mouse_click`, `keyboard_type`               | Renamed to `desktop_click`, `desktop_type` so LM Studio routes them clearly without colliding with other servers.   |
-| `mcp.json` mixed model + server settings                | `lmstudio_config.json` now only contains the launch command. Model/context settings live inside LM Studio.         |
+| `mcp.json` mixed model + server settings                | `lmstudio_config.json` / `jan_config.json` now only contain the launch command.                                    |
 
 The legacy `server.py` is still in the repo — `server_v2.py` is the new
-entry point and is what the docs and `lmstudio_config.json` point at.
+entry point and is what the docs and config files point at.
 
 ---
 
@@ -80,21 +80,45 @@ entry point and is what the docs and `lmstudio_config.json` point at.
 ```bat
 git clone https://github.com/Fizzolas/phantom-mcp C:\phantom-mcp
 cd C:\phantom-mcp
-py -m pip install -r requirements.txt
+install.bat
 ```
+
+`install.bat` creates a virtual environment, installs all dependencies,
+checks for Tesseract-OCR, and verifies the setup. Run it once before
+the first launch.
+
+### LM Studio
 
 In LM Studio → Settings → MCP Servers → **Add Server (Manual / stdio)**:
 
-- **Command:** `python`
-- **Args:** `server_v2.py`
-- **Working directory:** the folder you cloned into
+- **Command:** `C:\phantom-mcp\.venv\Scripts\python.exe`
+- **Args:** `C:\phantom-mcp\server_v2.py`
+- **Working directory:** `C:\phantom-mcp`
 
-Restart LM Studio, load a tool-capable model, set context to 16k+, and
+Or import the ready-made config from [`lmstudio_config.json`](lmstudio_config.json).
+
+### Jan.ai
+
+In Jan → Settings → Model Context Protocol → **Edit** the config JSON and add:
+
+```json
+"PhantomMCP": {
+  "active": true,
+  "command": "C:\\phantom-mcp\\.venv\\Scripts\\python.exe",
+  "args": ["C:\\phantom-mcp\\server_v2.py"],
+  "cwd": "C:\\phantom-mcp",
+  "env": {}
+}
+```
+
+Or import the ready-made config from [`jan_config.json`](jan_config.json).
+
+Restart your AI host, load a tool-capable model, set context to 16k+, and
 ask in chat:
 
 > List the phantom tools you have, take a screenshot, and tell me what's on screen.
 
-If anything goes wrong, look in `logs/server_v2.log`.
+If anything goes wrong, look in `logs\server_v2.log`.
 
 ---
 
@@ -120,7 +144,7 @@ with it; the two memory stores remain independent on purpose.
 
 ## How outputs respect your context window
 
-At boot, phantom asks LM Studio for the loaded model's context length
+At boot, phantom asks LM Studio or Jan.ai for the loaded model's context length
 (via the SDK if available, otherwise the OpenAI-compatible REST API).
 A `TokenBudget` is sized from that. Every tool result is passed through
 `fit_any` before it ships back, so a 50,000-character file or a giant
@@ -129,8 +153,6 @@ shell output gets truncated with a sentinel like:
 > ...<output truncated by phantom budget: showing 14,400 of 51,920 chars; re-run with a narrower query, pagination args, or raw=True>
 
 The model can see that and choose to call again with a tighter range.
-This is the "context economy" rule from the refactor plan — tool names,
-descriptions, and outputs all compete for the same window.
 
 ---
 
@@ -147,20 +169,26 @@ fires immediately and aborts any in-progress mouse/keyboard action.
 phantom-mcp/
 ├── server_v2.py              ← NEW: slim MCP entry point on the registry
 ├── server.py                 ← legacy entry point (kept; not used by v2)
-├── lmstudio_config.json      ← example mcp.json fragment
-├── requirements.txt
+├── lmstudio_config.json      ← ready-to-paste LM Studio MCP config
+├── jan_config.json           ← ready-to-paste Jan.ai MCP config
+├── install.bat               ← one-click installer (venv + deps + checks)
+├── launch.bat                ← start the server manually
+├── requirements.txt          ← full dependency list (tiered: core + optional)
+├── requirements-core.txt     ← minimal install (server starts with these alone)
+├── SYSTEM_PROMPT.md          ← recommended system prompt for your AI model
 ├── docs/
-│   ├── getting-started.md    ← beginner-friendly setup
-│   └── refactor-plan.md      ← architecture story
-├── phantom/                  ← new package — registry, contracts, memory, cognition, tools
+│   ├── getting-started.md    ← beginner-friendly setup guide
+│   ├── mind-body.md          ← architecture mental model
+│   └── refactor-plan.md      ← v2 architecture story
+├── phantom/                  ← core package: registry, contracts, memory, cognition, tools
 │   ├── contracts/            ← ToolResult envelope + error classifier
-│   ├── runtime/              ← safe_call, capability probe, LM Studio probe, budget
+│   ├── runtime/              ← safe_call, capability probe, LM Studio/Jan probe, budget
 │   ├── memory/               ← PhantomMemory store (facts/tasks/traces/lessons/notes)
 │   ├── cognition/            ← AgentCognition: goals, plans, reflection, risk, AAR
 │   └── tools/                ← every @tool lives here; one module per category
 ├── memory/                   ← legacy memory manager (used by server.py only)
-├── tools/                    ← legacy tool implementations; phantom/tools wrap these
-├── tests/                    ← pytest tests (82 tests, all passing as of v2)
+├── tools/                    ← legacy tool implementations; phantom/tools wraps these
+├── tests/                    ← pytest test suite
 ├── data/                     ← created at runtime; memory state lives here
 └── logs/                     ← server_v2.log lives here
 ```
