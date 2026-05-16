@@ -9,6 +9,15 @@ hallucinating.
 
 None of these tools take action on the user's machine. They read and
 write phantom memory only.
+
+Async-correctness note:
+  AgentCognition.goal_start, plan_set, plan_advance, checkpoint,
+  after_action_review, and replan are all async def. The tool wrappers
+  that call them must therefore also be async def and await the result.
+  Pure read-only methods (next_action, status, reflect, risk_check,
+  understand, confidence_check, action_review, stuck_detect, recover)
+  remain sync in AgentCognition and can be called from sync or async
+  wrappers.
 """
 from __future__ import annotations
 
@@ -127,8 +136,13 @@ class RecoverIn(BaseModel):
 
 
 # ---- tools ------------------------------------------------------------------
+# async def wrappers: goal_start, plan_set, plan_advance, checkpoint,
+# after_action_review, replan all call async AgentCognition methods.
+# sync def wrappers: next_action, status, reflect, risk_check, understand,
+# confidence_check, action_review, stuck_detect, recover are all sync.
+
 @tool("agent_goal_start", category="cognition", schema=GoalStartIn, timeout_s=5.0)
-def agent_goal_start(
+async def agent_goal_start(
     task_id: str,
     goal: str,
     acceptance: str = "",
@@ -139,31 +153,31 @@ def agent_goal_start(
     most relevant facts and lessons retrieved by goal text. Call
     agent_plan_set next.
     """
-    r = _cog().goal_start(
+    r = await _cog().goal_start(
         task_id, goal, acceptance=acceptance, constraints=constraints
     )
     return ok(r) if r.get("ok") else fail(r["error"], category="client_error")
 
 
 @tool("agent_plan_set", category="cognition", schema=PlanSetIn, timeout_s=5.0)
-def agent_plan_set(task_id: str, steps: list[str]) -> dict:
+async def agent_plan_set(task_id: str, steps: list[str]) -> dict:
     """
     Store an ordered plan for a task. Each step should be one tool call
     or one short observable action. Plan persists across sessions so
     interruption recovery is possible.
     """
-    r = _cog().plan_set(task_id, steps)
+    r = await _cog().plan_set(task_id, steps)
     return ok(r) if r.get("ok") else fail(r["error"], category="client_error")
 
 
 @tool("agent_plan_advance", category="cognition", schema=PlanAdvanceIn, timeout_s=3.0)
-def agent_plan_advance(task_id: str, step_ok: bool = True, note: str = "") -> dict:
+async def agent_plan_advance(task_id: str, step_ok: bool = True, note: str = "") -> dict:
     """
     Mark the current plan step as completed (or failed) and move the
     cursor to the next step. Call this *after* the actual tool call
     that performed the step.
     """
-    r = _cog().plan_advance(task_id, step_ok=step_ok, note=note)
+    r = await _cog().plan_advance(task_id, step_ok=step_ok, note=note)
     return ok(r) if r.get("ok") else fail(r["error"], category="client_error")
 
 
@@ -213,13 +227,13 @@ def agent_risk_check(tool: str, args: dict | None = None) -> dict:
 
 
 @tool("agent_checkpoint", category="cognition", schema=CheckpointIn, timeout_s=3.0)
-def agent_checkpoint(task_id: str, intent: str, expected: str) -> dict:
+async def agent_checkpoint(task_id: str, intent: str, expected: str) -> dict:
     """
     Record an intent before acting: what you are about to do and what
     you expect to observe. Returns a checkpoint_id to feed into
     agent_after_action_review afterwards.
     """
-    r = _cog().checkpoint(task_id, intent=intent, expected=expected)
+    r = await _cog().checkpoint(task_id, intent=intent, expected=expected)
     return ok(r) if r.get("ok") else fail(r["error"], category="client_error")
 
 
@@ -229,7 +243,7 @@ def agent_checkpoint(task_id: str, intent: str, expected: str) -> dict:
     schema=AfterActionIn,
     timeout_s=5.0,
 )
-def agent_after_action_review(
+async def agent_after_action_review(
     checkpoint_id: str,
     observed: str = "",
     success: bool = True,
@@ -240,7 +254,7 @@ def agent_after_action_review(
     repeated success of the same intent pattern, this can promote a
     durable lesson the model will see on future calls.
     """
-    r = _cog().after_action_review(
+    r = await _cog().after_action_review(
         checkpoint_id,
         observed=observed,
         success=success,
@@ -323,14 +337,14 @@ def agent_stuck_detect(task_id: str = "") -> dict:
 
 
 @tool("agent_replan", category="cognition", schema=ReplanIn, timeout_s=5.0)
-def agent_replan(task_id: str, reason: str, new_steps: list[str] | None = None) -> dict:
+async def agent_replan(task_id: str, reason: str, new_steps: list[str] | None = None) -> dict:
     """
     Replace the current plan for a task. Pass new_steps=None first to get
     a recommendation packet (previous plan + stuck signals), then call
     again with new_steps populated to commit the new plan. The reason is
     written to the task timeline.
     """
-    r = _cog().replan(task_id, reason=reason, new_steps=new_steps)
+    r = await _cog().replan(task_id, reason=reason, new_steps=new_steps)
     return ok(r) if r.get("ok") else fail(r["error"], category="client_error")
 
 
