@@ -90,21 +90,18 @@ if errorlevel 1 (
     echo.
     echo [WARN] Tesseract-OCR binary NOT found on PATH.
     echo.
-    echo        Phantom's OCR tools (desktop_ocr, desktop_find_text,
-    echo        desktop_wait_for_text) require the Tesseract binary.
+    echo        Phantom's OCR tools require the Tesseract binary.
     echo        desktop_watch does NOT require Tesseract.
     echo.
     echo        Install steps:
-    echo          1. Download the Windows installer from:
-    echo             https://github.com/UB-Mannheim/tesseract/wiki
-    echo          2. Run the installer (default location is fine).
+    echo          1. Download: github.com/UB-Mannheim/tesseract/wiki
+    echo          2. Run the installer ^(default location is fine^).
     echo          3. Add Tesseract to PATH:
     echo             System Properties -^> Advanced -^> Environment Variables
     echo             Add "C:\Program Files\Tesseract-OCR" to the Path variable.
-    echo          4. Re-run install.bat to verify it is detected.
+    echo          4. Re-run install.bat to verify detection.
     echo.
-    echo        You can continue without Tesseract; OCR tools will return
-    echo        ok=false with a clear error and the install hint above.
+    echo        OCR tools will return ok=false with an install hint if missing.
     echo.
 ) else (
     echo [OK] Tesseract found on PATH.
@@ -141,10 +138,9 @@ if not errorlevel 1 (
 )
 
 if %HOST_FOUND%==0 (
-    echo [WARN] No AI host found on port 1234 (LM Studio) or 1337 (Jan.ai).
-    echo        Phantom will start in offline mode (memory/file/shell tools still work).
-    echo        Start LM Studio or Jan.ai with a model loaded before running launch.bat
-    echo        if you want the model to be able to use AI-assisted features.
+    echo [WARN] No AI host found on port 1234 or 1337.
+    echo        Phantom starts in offline mode - memory/file/shell tools still work.
+    echo        Start LM Studio or Jan.ai with a model loaded before running launch.bat.
 )
 
 :: -------------------------------------------------------------------
@@ -155,9 +151,9 @@ echo ============================================================
 echo  Installation complete!
 echo.
 echo  REQUIRED before first run:
-echo    - LM Studio (port 1234) OR Jan.ai (port 1337) running with
+echo    - LM Studio ^(port 1234^) OR Jan.ai ^(port 1337^) running with
 echo      a model loaded and local server enabled
-echo    - Tesseract-OCR installed + on PATH (for OCR tools only)
+echo    - Tesseract-OCR installed + on PATH ^(for OCR tools only^)
 echo.
 echo  Run launch.bat to start the Phantom MCP server.
 echo ============================================================
