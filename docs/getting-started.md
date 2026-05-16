@@ -10,11 +10,11 @@ to help.
 ## What this server actually does
 
 Phantom-MCP is a small program that runs on your PC and exposes a set
-of "tools" to the language model loaded in LM Studio. The model can
+of "tools" to the language model loaded in LM Studio or Jan.ai. The model can
 call these tools to take screenshots, click, type, run shell commands,
 open files, focus windows, remember things between sessions, and so on.
 
-**You still talk to the model through the LM Studio chat box.** Phantom
+**You still talk to the model through the chat box.** Phantom
 is not a chat UI — it is the model's hands.
 
 ---
@@ -28,10 +28,10 @@ is not a chat UI — it is the model's hands.
    remember things; smaller context (4k–8k) still works but the model
    forgets older steps faster.
 
-2. **mcp.json launches MCP servers — nothing else.** Your model name,
-   context length, GPU offload, etc. live inside LM Studio's own
-   settings. Don't try to put them in `mcp.json`. The example config in
-   this repo only contains the launch command.
+2. **Config files launch MCP servers — nothing else.** Your model name,
+   context length, GPU offload, etc. live inside LM Studio's (or Jan.ai's)
+   own settings. Don't try to put them in the MCP config. The example
+   configs in this repo only contain the launch command.
 
 ---
 
@@ -59,67 +59,94 @@ You should see `Python 3.11.x` or higher. If `py` is not found:
 - During install, **check "Add python.exe to PATH"**.
 - Open a NEW command prompt (the PATH update doesn't apply to the open one).
 
-If `py` works but `pip` doesn't, run `py -m ensurepip --upgrade` once.
+### 3. Run the installer
 
-### 3. Install the Python packages Phantom needs
-
-```bat
-py -m pip install --upgrade pip
-py -m pip install -r requirements.txt
-```
-
-If something in `requirements-optional.txt` matters to you (e.g.
-playwright for browser automation), install it too:
+Double-click **`install.bat`** in the `C:\phantom-mcp` folder, or run:
 
 ```bat
-py -m pip install -r requirements-optional.txt
+C:\phantom-mcp\install.bat
 ```
 
-### 4. Tell LM Studio about the server
+This will:
+- Check your Python version is 3.8 or higher
+- Create a virtual environment (`.venv`) inside the folder
+- Install all required Python packages
+- Create the `data\phantom_memory` folder Phantom writes to
+- Tell you if any optional tools (like Tesseract-OCR for screen text reading) are missing
+
+If you see a red error during install, read the message — it will tell you exactly what
+to install or fix. Then run `install.bat` again.
+
+> **Tip:** You only need to run `install.bat` once. After that, use `launch.bat` to start the server.
+
+### 4. Tell your AI host about the server
+
+#### LM Studio
 
 1. Open LM Studio.
 2. Go to **Settings → MCP Servers → Add Server (Manual / stdio)**.
-3. Paste the values from `lmstudio_config.json`:
-   - **Command:** `python` (or the full path to your Python, e.g. `C:\Program Files\Python311\python.exe`)
-   - **Args:** `server_v2.py`
+3. Use these values:
+   - **Command:** `C:\phantom-mcp\.venv\Scripts\python.exe`
+   - **Args:** `C:\phantom-mcp\server_v2.py`
    - **Working directory:** `C:\phantom-mcp`
 4. Save. Restart LM Studio.
 
-Phantom is self-contained — you don't need any other MCP server
-running. If you happen to use one (any second server is fine), they
-each get their own stdio pipe and won't interfere.
+Or import the ready-made JSON from [`lmstudio_config.json`](../lmstudio_config.json).
+
+> **Why the full path?** Phantom uses a virtual environment with its own copy of Python.
+> If you type just `python`, LM Studio might launch the wrong Python and fail to import
+> the packages Phantom needs.
+
+#### Jan.ai
+
+1. Open Jan.
+2. Go to **Settings → Model Context Protocol → Edit** (the pencil icon on the config).
+3. Add the following to the JSON object:
+
+```json
+"PhantomMCP": {
+  "active": true,
+  "command": "C:\\phantom-mcp\\.venv\\Scripts\\python.exe",
+  "args": ["C:\\phantom-mcp\\server_v2.py"],
+  "cwd": "C:\\phantom-mcp",
+  "env": {}
+}
+```
+
+Or import the ready-made config from [`jan_config.json`](../jan_config.json).
+
+4. Save. Restart Jan.
 
 ### 5. Pick a model with tool use enabled
 
-In LM Studio's model panel, load any model that supports function/tool
-calling. Make sure the **Tool Use** toggle is on in the chat panel.
+Load any model that supports function/tool calling.
+Make sure the **Tool Use** toggle is on in the chat panel.
 Set the **Context Length** to at least 16384 (32768 if you can spare
 the VRAM).
 
 ### 6. Try a sanity command
 
-In the LM Studio chat, send:
+In the chat, send:
 
 > Show me a list of phantom tools you have available, then take a
 > screenshot and tell me what you see.
 
-The model should call `list_tools` (LM Studio does this automatically),
+The model should call `list_tools` (your AI host does this automatically),
 then call `desktop_screenshot`, and describe your screen.
 
 If the model says it has no tools, the most common causes are:
-- LM Studio is set to a model that doesn't support tool use.
-- The MCP server failed to start. Look in `logs/server_v2.log` for the
-  reason.
-- You're pointing at the wrong working directory.
+- The model doesn't support tool use, or the Tool Use toggle is off.
+- The MCP server failed to start. Look in `logs\server_v2.log` for the reason.
+- You're pointing at the wrong working directory or Python path.
 
 ---
 
 ## How the model "remembers" things
 
-Phantom gives the model its own memory under `data/phantom_memory/`.
+Phantom gives the model its own memory under `data\phantom_memory\`.
 You can open this folder at any time to see what it has stored.
 
-There are four kinds of memory:
+There are five kinds of memory:
 
 | Kind     | What it stores                                  | Tool prefix          |
 |----------|-------------------------------------------------|----------------------|
@@ -137,27 +164,28 @@ single fact and keep things lean.
 
 **Phantom owns its own memory.** It tracks environment/desktop state
 and the model's task history. If you also run a different MCP server
-that does its own memory, the two are independent — they do not auto-
-sync, and that is intentional.
+that does its own memory, the two are independent — they do not auto-sync,
+and that is intentional.
 
 ---
 
 ## When things go wrong
 
-- **Look in `logs/server_v2.log`.** Phantom writes every tool call,
+- **Look in `logs\server_v2.log`.** Phantom writes every tool call,
   every error, and every retry there.
 - **Use `memory_trace_failures` from the chat.** Ask the model to call
   it and report what's been failing.
 - **Stop everything fast:** move your mouse to the top-left corner
   (0,0). PyAutoGUI's emergency brake fires immediately and aborts any
   in-progress mouse/keyboard action.
-- **Reset memory:** delete files inside `data/phantom_memory/`. The
+- **Reset memory:** delete files inside `data\phantom_memory\`. The
   next run will recreate them empty.
 
 ---
 
 ## Where to go from here
 
-- Read `SYSTEM_PROMPT.md` for the full system prompt to put in LM Studio.
-- Read `docs/refactor-plan.md` for the architecture story.
+- Read `SYSTEM_PROMPT.md` for the full system prompt to put in your AI host.
+- Read `docs/mind-body.md` for the mental model (LM Studio = mind, Phantom = body).
+- Read `docs/refactor-plan.md` for the v2 architecture story.
 - Skim `phantom/tools/__init__.py` to see every tool the server registers.
