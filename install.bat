@@ -107,15 +107,7 @@ if errorlevel 1 (
     echo        ok=false with a clear error and the install hint above.
     echo.
 ) else (
-    :: Capture version without goto inside a for block (fixes "unexpected at this time")
-    set TESS_VER=unknown
-    for /f "tokens=*" %%t in ('tesseract --version 2^>^&1') do (
-        if not defined TESS_FOUND (
-            set TESS_VER=%%t
-            set TESS_FOUND=1
-        )
-    )
-    echo [OK] Found Tesseract: %TESS_VER%
+    echo [OK] Tesseract found on PATH.
 )
 
 :: -------------------------------------------------------------------
