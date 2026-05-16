@@ -18,6 +18,19 @@ What changed vs server.py:
     sizes the token budget. If none are found we fall back to 8k context
     and keep running — all tools that don't need the host stay available.
 
+STDIO SAFETY NOTE
+-----------------
+MCP uses stdin/stdout as a transport. ANY byte written to stdout before
+the MCP framing loop starts will corrupt the handshake. Jan.ai (and
+other strict hosts) immediately close the connection when they see
+unexpected bytes — this is what causes the crash on Jan.
+
+To prevent this we redirect Python's sys.stdout to sys.stderr as the
+very first action, before any import that might print(). All logging
+goes to a file + stderr only. The MCP library writes to the raw
+stdin/stdout file descriptors directly, bypassing sys.stdout, so it
+is unaffected by this redirect.
+
 Host port map (auto-detected, override with env vars):
   LM Studio   : http://localhost:1234/v1   (PHANTOM_HOST_URL to override)
   Jan.ai      : http://localhost:1337/v1   (PHANTOM_HOST_URL to override)
@@ -31,11 +44,22 @@ Force a specific host (useful if auto-detect picks the wrong one):
 """
 from __future__ import annotations
 
+import sys
+
+# --- STDIO SAFETY: redirect stdout to stderr BEFORE any other import --------
+# MCP transport owns stdout. Any stray print() or import-time output will
+# corrupt the JSON-RPC framing and cause Jan.ai / other strict hosts to
+# immediately kill the connection. Redirecting sys.stdout to sys.stderr here
+# means accidental prints go to the log stream, not the MCP pipe.
+# This must happen before every other import.
+_original_stdout = sys.stdout
+sys.stdout = sys.stderr
+# ---------------------------------------------------------------------------
+
 import asyncio
 import json
 import logging
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -253,6 +277,9 @@ async def call_tool(name: str, arguments: dict | None = None) -> list[types.Text
 async def _main() -> None:
     await _refresh_runtime_state()
     log.info("phantom-mcp v2 ready: %d tools advertised.", len(registry.available()))
+    # Restore stdout to the original fd so the MCP stdio transport
+    # can write to the real stdout pipe that Jan/LM Studio is reading.
+    sys.stdout = _original_stdout
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
 

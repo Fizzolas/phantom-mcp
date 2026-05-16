@@ -27,7 +27,7 @@ Public API:
   note_list()                     -> list[dict]
   note_delete(label)              -> dict
 
-  learn_from_traces(window=200)   -> dict     # distill lessons; LM Studio if reachable
+  learn_from_traces(window=200)   -> dict     # distill lessons; host if reachable
   compact(target_chars=20000)     -> dict     # retire old traces, summarize tasks
 
 The store is process-local and file-backed. Concurrency is async-safe
@@ -44,13 +44,20 @@ Pass 5 notes:
              the summary fact, preventing a crash from leaving a dangling
              trace_summary key that points to un-trimmed traces.
   Issue 2 — _ask_lms_for_lesson() now accepts model_id parameter; callers
-             pass the real LM Studio model ID instead of "local-model".
-             learn_from_traces() logs a warning when the LMS call fails
+             pass the real host model ID instead of "local-model".
+             learn_from_traces() logs a warning when the host call fails
              rather than silently swallowing the exception.
   Issue 6 — trace_recent() uses a tail-style file reader (_read_traces_tail)
              to avoid loading the entire traces.jsonl into RAM on every call.
              trace_failures() and learn_from_traces() still do a full read
              (they need the whole window), but recent() is now O(tail-size).
+
+Pass 6 notes:
+  Issue 1 — asyncio.Lock() is now lazy-initialised on first use instead of
+             at __init__ time. Creating a Lock before the asyncio event loop
+             starts raises RuntimeError in Python 3.10+ when the lock is first
+             awaited. PhantomMemory.__init__ is called at module import time
+             (before asyncio.run()), so the lock must be created lazily.
 """
 from __future__ import annotations
 
@@ -85,11 +92,22 @@ class PhantomMemory:
         self.dir.mkdir(parents=True, exist_ok=True)
         (self.dir / "notes").mkdir(exist_ok=True)
         self.config = config or MemoryConfig(data_dir=self.dir)
-        self._lock = asyncio.Lock()
+        # Pass 6 Issue 1: do NOT create asyncio.Lock at __init__ time.
+        # __init__ is called before asyncio.run() starts the event loop.
+        # Lock() created here has no loop to attach to in Python 3.10+
+        # and raises RuntimeError on first await. Lazy-init on first use.
+        self._lock: asyncio.Lock | None = None
         # In-memory caches (re-read on each instance creation, written through).
         self._facts: dict[str, dict] = self._read_json("facts.json", {})
         self._tasks: dict[str, dict] = self._read_json("tasks.json", {})
         self._lessons: dict[str, dict] = self._read_json("lessons.json", {})
+
+    @property
+    def _alock(self) -> asyncio.Lock:
+        """Lazy asyncio.Lock — created on first async access after the event loop is running."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     # ------------------------------------------------------------------
     # Disk helpers
@@ -135,11 +153,7 @@ class PhantomMemory:
     # FACTS
     # ------------------------------------------------------------------
     async def fact_set(self, key: str, value: str) -> dict:
-        """
-        Pass 4 Issue 1: async + locked so concurrent tool calls can't
-        interleave reads and writes on the same facts dict.
-        """
-        async with self._lock:
+        async with self._alock:
             self._facts[key] = {"value": value, "updated": time.time()}
             self._write_json("facts.json", self._facts)
             return {"ok": True, "key": key, "chars": len(value)}
@@ -151,7 +165,7 @@ class PhantomMemory:
         return {"ok": True, "key": key, "value": entry["value"], "updated": entry.get("updated")}
 
     async def fact_delete(self, key: str) -> dict:
-        async with self._lock:
+        async with self._alock:
             if key in self._facts:
                 del self._facts[key]
                 self._write_json("facts.json", self._facts)
@@ -187,7 +201,7 @@ class PhantomMemory:
     # TASKS
     # ------------------------------------------------------------------
     async def task_start(self, task_id: str, goal: str) -> dict:
-        async with self._lock:
+        async with self._alock:
             self._tasks[task_id] = {
                 "goal": goal,
                 "status": "in_progress",
@@ -200,7 +214,7 @@ class PhantomMemory:
             return {"ok": True, "task_id": task_id}
 
     async def task_step(self, task_id: str, step: str, ok: bool = True, detail: str = "") -> dict:
-        async with self._lock:
+        async with self._alock:
             task = self._tasks.get(task_id) or {
                 "goal": task_id, "status": "in_progress", "steps": [],
                 "summary": "", "created": time.time(),
@@ -219,7 +233,7 @@ class PhantomMemory:
             return {"ok": True, "task_id": task_id, "step_count": len(task["steps"])}
 
     async def task_finish(self, task_id: str, status: str = "done", summary: str = "") -> dict:
-        async with self._lock:
+        async with self._alock:
             task = self._tasks.get(task_id)
             if task is None:
                 return {"ok": False, "error": f"unknown task {task_id!r}"}
@@ -271,14 +285,11 @@ class PhantomMemory:
             "category": category,
             "latency_ms": latency_ms,
         }
-        async with self._lock:
+        async with self._alock:
             with (self.dir / "traces.jsonl").open("a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     def trace_recent(self, limit: int = 20, tool: str | None = None) -> list[dict]:
-        # Pass 5 Issue 6: use tail-style read to avoid loading the full file.
-        # If a tool filter is applied we need more lines to get enough matches,
-        # so over-fetch by 4x and let the filter reduce it.
         fetch = limit * 4 if tool else limit
         traces = self._read_traces_tail(fetch)
         if tool:
@@ -304,13 +315,6 @@ class PhantomMemory:
         return out
 
     def _read_traces_tail(self, n: int) -> list[dict]:
-        """
-        Pass 5 Issue 6: read only the last ~n records from traces.jsonl
-        by seeking to the end of the file rather than loading the whole
-        thing into RAM. Uses a heuristic chunk size (n * 512 bytes) that
-        comfortably covers typical trace line lengths; falls back to the
-        full file if the file is smaller than the chunk.
-        """
         p = self.dir / "traces.jsonl"
         if not p.exists():
             return []
@@ -322,7 +326,6 @@ class PhantomMemory:
                 f.seek(-chunk, 2)
                 raw = f.read().decode("utf-8", errors="replace")
         except Exception:
-            # Fallback: full read if seek fails (e.g., non-seekable fs).
             raw = p.read_text(encoding="utf-8", errors="replace")
         lines = raw.splitlines()
         result = []
@@ -340,7 +343,7 @@ class PhantomMemory:
     # LESSONS (distilled action knowledge)
     # ------------------------------------------------------------------
     async def lesson_set(self, name: str, body: str, *, source: str = "manual") -> dict:
-        async with self._lock:
+        async with self._alock:
             self._lessons[name] = {"body": body, "updated": time.time(), "source": source}
             self._write_json("lessons.json", self._lessons)
             return {"ok": True, "name": name}
@@ -355,7 +358,7 @@ class PhantomMemory:
         ]
 
     async def lesson_delete(self, name: str) -> dict:
-        async with self._lock:
+        async with self._alock:
             if name in self._lessons:
                 del self._lessons[name]
                 self._write_json("lessons.json", self._lessons)
@@ -377,7 +380,7 @@ class PhantomMemory:
             "chunk_chars": self.config.note_chunk_chars,
             "updated": time.time(),
         }
-        async with self._lock:
+        async with self._alock:
             out_dir = self.dir / "notes" / _safe_filename(label)
             out_dir.mkdir(parents=True, exist_ok=True)
             for i, c in enumerate(chunks):
@@ -438,15 +441,6 @@ class PhantomMemory:
         lms_base: str | None = None,
         lms_base_model_id: str | None = None,
     ) -> dict:
-        """
-        Look at recent traces; record one or more lessons for tools that
-        repeatedly fail. Heuristic-only by default; if `lms_base` is given,
-        try to ask LM Studio for a free-form summary.
-
-        Pass 5 Issue 2: lms_base_model_id is forwarded to _ask_lms_for_lesson
-        so it uses the real loaded model ID rather than "local-model". If the
-        LMS call fails, a warning is logged instead of silently swallowing.
-        """
         all_traces = list(self._read_traces())
         recent = all_traces[-window:]
         failures: dict[str, list[dict]] = {}
@@ -477,7 +471,7 @@ class PhantomMemory:
 
             if lms_base:
                 try:
-                    body = await _ask_lms_for_lesson(
+                    body = await _ask_host_for_lesson(
                         lms_base,
                         tool_name,
                         fails,
@@ -486,7 +480,7 @@ class PhantomMemory:
                     )
                 except Exception as exc:
                     log.warning(
-                        "LM Studio lesson generation failed for tool %r "
+                        "Host lesson generation failed for tool %r "
                         "(model_id=%r): %s — using heuristic body instead.",
                         tool_name,
                         lms_base_model_id,
@@ -504,22 +498,6 @@ class PhantomMemory:
         }
 
     async def compact(self, target_chars: int = 20_000) -> dict:
-        """
-        Trim trace log to last N records. Records older than that are
-        replaced by an aggregate summary appended into facts under
-        `trace_summary:<timestamp>` so we never lose the long-term shape.
-
-        Pass 4 Issue 2: traces.jsonl is rewritten atomically via a
-        .jsonl.tmp file renamed into place, matching _write_json's pattern.
-
-        Pass 5 Issue 1: write order is now TRACES FIRST, SUMMARY SECOND.
-        If the server crashes between the two writes, the trace file is
-        already trimmed and the summary fact is simply missing — which is
-        recoverable. The previous order (summary first, then trim) could
-        leave a dangling summary key pointing to un-trimmed traces, causing
-        compaction to believe it had already run and the trace log to grow
-        forever on restart.
-        """
         traces = list(self._read_traces())
         if len(traces) <= self.config.trace_keep_after_compact:
             return {"ok": True, "trimmed": False, "kept": len(traces)}
@@ -541,21 +519,15 @@ class PhantomMemory:
         }
         ts = int(time.time())
 
-        # Pass 5 Issue 1: STEP 1 — atomically rewrite traces.jsonl FIRST.
-        # A crash here leaves the old traces intact and no summary fact written.
         p = self.dir / "traces.jsonl"
         tmp = p.with_suffix(".jsonl.tmp")
-        async with self._lock:
+        async with self._alock:
             tmp.write_text(
                 "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept),
                 encoding="utf-8",
             )
             tmp.replace(p)
 
-        # Pass 5 Issue 1: STEP 2 — only AFTER the trace rewrite succeeds,
-        # record the summary fact. A crash here loses the summary key, but
-        # the traces are already trimmed, so the next compact() will just
-        # redo the summary with the next batch.
         await self.fact_set(f"trace_summary:{ts}", json.dumps(summary, ensure_ascii=False))
 
         return {"ok": True, "trimmed": True, "kept": len(kept), "summary_key": f"trace_summary:{ts}"}
@@ -585,7 +557,7 @@ def _safe_filename(label: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", label)[:120] or "_unnamed"
 
 
-async def _ask_lms_for_lesson(
+async def _ask_host_for_lesson(
     base: str,
     tool: str,
     fails: list[dict],
@@ -594,10 +566,9 @@ async def _ask_lms_for_lesson(
     model_id: str = "local-model",
 ) -> str:
     """
-    Pass 5 Issue 2: model_id is now a proper parameter instead of being
-    hardcoded to "local-model". Callers should pass the real loaded model
-    identifier obtained from the LM Studio probe so that the /chat/completions
-    request is correctly routed by LM Studio's REST API.
+    Ask the loaded host model (LM Studio or Jan.ai) to write an operational
+    lesson for a repeatedly-failing tool. Works with any OpenAI-compatible
+    /chat/completions endpoint.
     """
     import httpx
 
