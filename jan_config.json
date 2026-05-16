@@ -1,0 +1,47 @@
+{
+  "_comment_1": "Phantom MCP — config entry for Jan.ai. In Jan, go to Settings → MCP Servers → Add Server, then paste the 'mcpServers' block below.",
+  "_comment_2": "Jan.ai speaks the same OpenAI-compatible API as LM Studio but on port 1337. server_v2.py auto-detects this — no extra flags needed.",
+  "_comment_cwd": "IMPORTANT: set 'cwd' to the absolute path of your phantom-mcp folder on this machine. Example: C:\\phantom-mcp",
+  "_comment_python": "Jan runs server_v2.py as a child process. Use 'py -3.11' on Windows (matches your existing setup) or 'python3' on Mac/Linux.",
+
+  "mcpServers": {
+    "PhantomMCP": {
+      "command": "py",
+      "args": ["-3.11", "server_v2.py"],
+      "cwd": "C:\\phantom-mcp",
+      "env": {}
+    }
+  },
+
+  "_recommended_jan_settings": {
+    "context_length_min": 16384,
+    "context_length_recommended": 32768,
+    "tool_use": "enabled",
+    "rationale": [
+      "Phantom auto-detects Jan.ai on port 1337 and sizes its token budget to your loaded model's context window.",
+      "If Jan is running on a non-standard port, set the env var PHANTOM_HOST_URL in the entry below, e.g. 'PHANTOM_HOST_URL': 'http://localhost:9999/v1'.",
+      "Screenshots default to ~2.5k tokens (downscaled JPEG). desktop_screenshot(hires=true) is much heavier — only use when you need to read fine text.",
+      "If you have a small-context model (4k-8k), phantom will trim outputs more aggressively. Run memory_compact periodically."
+    ]
+  },
+
+  "_custom_port_example": {
+    "_note": "Only needed if Jan.ai is on a non-default port. Add PHANTOM_HOST_URL to the env block.",
+    "mcpServers": {
+      "PhantomMCP": {
+        "command": "py",
+        "args": ["-3.11", "server_v2.py"],
+        "cwd": "C:\\phantom-mcp",
+        "env": {
+          "PHANTOM_HOST_URL": "http://localhost:1337/v1"
+        }
+      }
+    }
+  },
+
+  "_run_alongside_other_mcp_servers": [
+    "Phantom is self-contained — no other MCP server is required.",
+    "If you run a second MCP server alongside it in Jan, that is fine: Jan talks to each over its own stdio pipe.",
+    "Tool names are namespaced (desktop_*, memory_*, file_*, window_*, process_*, shell_*, agent_*) so the model routes cleanly even with multiple servers loaded."
+  ]
+}

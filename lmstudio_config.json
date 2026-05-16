@@ -2,6 +2,7 @@
   "_comment_1": "Phantom MCP — example mcp.json entry for LM Studio. Paste the 'mcpServers' object into LM Studio → Settings → MCP Servers (Manual / stdio).",
   "_comment_2": "DO NOT put model/context settings here. Set those inside LM Studio's model panel — mcp.json launches MCP servers, nothing else.",
   "_comment_cwd": "IMPORTANT: set 'cwd' to the absolute path of your phantom-mcp clone on this machine. The value '.' is a safe default when you launch LM Studio from the phantom-mcp directory, but most users should set an explicit path, e.g. C:\\Users\\yourname\\phantom-mcp or /home/yourname/phantom-mcp.",
+  "_comment_multihost": "server_v2.py now auto-detects LM Studio (port 1234), Jan.ai (port 1337), or any host set via PHANTOM_HOST_URL. No flags needed — just run it.",
 
   "mcpServers": {
     "phantom": {
@@ -9,6 +10,20 @@
       "args": ["server_v2.py"],
       "cwd": ".",
       "env": {}
+    }
+  },
+
+  "_custom_port_example": {
+    "_note": "Only needed if LM Studio is on a non-default port. Add PHANTOM_HOST_URL to the env block.",
+    "mcpServers": {
+      "phantom": {
+        "command": "python",
+        "args": ["server_v2.py"],
+        "cwd": ".",
+        "env": {
+          "PHANTOM_HOST_URL": "http://localhost:1234/v1"
+        }
+      }
     }
   },
 
