@@ -1,0 +1,17 @@
+# Phantom MCP — CORE requirements only
+#
+# These are the bare minimum packages needed for the server to start.
+# The server boots in offline mode — memory, file, and shell tools work.
+# Desktop/OCR/vision tools require the full requirements.txt.
+#
+# Usage:
+#   pip install -r requirements-core.txt
+#
+# Then optionally:
+#   pip install -r requirements.txt     (all features)
+#   python -m playwright install chromium  (web tools)
+
+mcp>=1.0.0
+pydantic>=2.7.0
+httpx>=0.27.0
+python-dotenv>=1.0.0
